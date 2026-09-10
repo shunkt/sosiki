@@ -64,6 +64,15 @@ services:
       - --pooling
       - mean
       - --auto-truncate
+      # Defaults (max-batch-tokens=16384, max-client-batch-size=32) size
+      # warmup buffers for production throughput. Under amd64 emulation on
+      # Apple Silicon that blew past 11GB and got OOM-killed before ever
+      # reaching /health. This is single-user dev traffic — a far smaller
+      # batch is plenty and keeps warmup inside a few hundred MB.
+      - --max-batch-tokens
+      - "2048"
+      - --max-client-batch-size
+      - "8"
     ports:
       - "8081:80"
     volumes:
@@ -82,6 +91,10 @@ services:
       - --model-id
       - cl-nagoya/ruri-v3-reranker-310m
       - --auto-truncate
+      - --max-batch-tokens
+      - "2048"
+      - --max-client-batch-size
+      - "8"
     ports:
       - "8082:80"
     volumes:
