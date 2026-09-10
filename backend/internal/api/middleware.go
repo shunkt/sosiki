@@ -40,6 +40,12 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController reach the real ResponseWriter, which the
+// SSE handler needs for Flush. http.Flusher is not part of http.ResponseWriter,
+// so embedding does not promote it and the stream would otherwise buffer until
+// the handler returns.
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
 func requestLogger(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

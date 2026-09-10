@@ -68,6 +68,16 @@ func TestCORSOnlyEchoesAllowedOrigin(t *testing.T) {
 	}
 }
 
+func TestStatusRecorderSupportsFlush(t *testing.T) {
+	rec := &statusRecorder{ResponseWriter: httptest.NewRecorder(), status: http.StatusOK}
+
+	// Without Unwrap the controller cannot find the Flusher and SSE silently
+	// buffers every token until the handler returns.
+	if err := http.NewResponseController(rec).Flush(); err != nil {
+		t.Fatalf("Flush through statusRecorder: %v", err)
+	}
+}
+
 func TestPreflightReturnsNoContent(t *testing.T) {
 	req := httptest.NewRequest(http.MethodOptions, "/api/health", nil)
 	req.Header.Set("Origin", "http://localhost:5173")

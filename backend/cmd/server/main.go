@@ -29,9 +29,11 @@ func run(log *slog.Logger) error {
 		Addr:              cfg.Addr,
 		Handler:           api.NewHandler(cfg, log),
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// ReadTimeout and WriteTimeout stay unset. Both are absolute deadlines on
+		// the entire request/response, so either one would cut an SSE stream off
+		// mid-conversation. The SSE handler sets per-frame write deadlines with
+		// http.ResponseController instead.
+		IdleTimeout: 60 * time.Second,
 	}
 
 	// Serve in the background so main can wait on a shutdown signal.
