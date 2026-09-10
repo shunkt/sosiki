@@ -1,0 +1,99 @@
+name: kaigi
+
+# Development dependencies only. Nothing here is production-shaped: credentials
+# are the well-known defaults and every port is published to the host so the Go
+# backend can run outside compose during development.
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_PASSWORD: kaigi
+      POSTGRES_DB: kaigi
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d kaigi"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: creates the knowledge bucket, then exits. `docker compose ps` will
+  # show it as exited, which is the success state.
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/kaigi-knowledge &&
+        echo "bucket kaigi-knowledge ready"
+    restart: "no"
+
+  # TEI serves exactly one model per process, so embedding and reranking need
+  # separate containers. They share the HF cache volume so the ~2.5GB of weights
+  # is downloaded once and survives `docker compose down`.
+  tei-embed:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    platform: linux/amd64
+    command:
+      - --model-id
+      - cl-nagoya/ruri-v3-310m
+      - --pooling
+      - mean
+      - --auto-truncate
+    ports:
+      - "8081:80"
+    volumes:
+      - hf-cache:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 90
+      start_period: 60s
+
+  tei-rerank:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    platform: linux/amd64
+    command:
+      - --model-id
+      - cl-nagoya/ruri-v3-reranker-310m
+      - --auto-truncate
+    ports:
+      - "8082:80"
+    volumes:
+      - hf-cache:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 90
+      start_period: 60s
+
+volumes:
+  postgres-data:
+  minio-data:
+  hf-cache:
