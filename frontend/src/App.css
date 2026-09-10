@@ -1,0 +1,50 @@
+.app {
+  max-width: 32rem;
+  margin: 4rem auto;
+  padding: 0 1.5rem;
+  text-align: left;
+}
+
+.app h1 {
+  margin: 0 0 0.25rem;
+  font-size: 2rem;
+}
+
+.status {
+  margin: 0 0 2rem;
+  font-size: 0.9rem;
+  opacity: 0.75;
+}
+
+.status--ok {
+  color: #2e9e5b;
+}
+
+.status--unreachable {
+  color: #d24545;
+}
+
+.row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.row input {
+  flex: 1;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid currentColor;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.result {
+  margin-top: 1.5rem;
+  font-size: 1.1rem;
+}
+
+.error {
+  margin-top: 1.5rem;
+  color: #d24545;
+}
