@@ -14,22 +14,22 @@ import (
 )
 
 type Message struct {
-	ID        uuid.UUID
-	Role      string // "user" | "assistant"
-	Content   string
-	CreatedAt time.Time
+	ID        uuid.UUID `json:"id"`
+	Role      string    `json:"role"` // "user" | "assistant"
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 // Source is a citation as seen by the client: the persona-specific scores
 // alongside the human-readable location, so the UI can show how much the
 // persona moved each result rather than just the blended rank.
 type Source struct {
-	ChunkID    uuid.UUID
-	DocumentID uuid.UUID
-	Title      string
-	URL        string
-	Relevance  float32
-	Affinity   float32
+	ChunkID    uuid.UUID `json:"chunkId"`
+	DocumentID uuid.UUID `json:"documentId"`
+	Title      string    `json:"title"`
+	URL        string    `json:"url"`
+	Relevance  float32   `json:"relevance"`
+	Affinity   float32   `json:"affinity"`
 }
 
 type Conversation struct {
@@ -189,6 +189,22 @@ func (s *Store) SaveCitations(ctx context.Context, messageID uuid.UUID, candidat
 	return tx.Commit(ctx)
 }
 
+// DocumentObjectKey resolves a documents.id to its MinIO object key, for the
+// GET /api/documents/{id} redirect. It lives here rather than in a separate
+// documents package since chat.Store is already the general-purpose
+// Postgres access point for this domain and a single lookup does not
+// justify a new package.
+func (s *Store) DocumentObjectKey(ctx context.Context, id uuid.UUID) (string, error) {
+	var key string
+	if err := s.pool.QueryRow(ctx, `SELECT object_key FROM documents WHERE id = $1`, id).Scan(&key); err != nil {
+		if err == pgx.ErrNoRows {
+			return "", fmt.Errorf("chat: %w", ErrDocumentNotFound)
+		}
+		return "", fmt.Errorf("chat: document object key: %w", err)
+	}
+	return key, nil
+}
+
 func (s *Store) GetConversation(ctx context.Context, id uuid.UUID) (Conversation, error) {
 	var c Conversation
 	c.ID = id
@@ -214,3 +230,7 @@ func (s *Store) GetConversation(ctx context.Context, id uuid.UUID) (Conversation
 // ErrConversationNotFound lets API handlers map to 404 without matching on
 // error text.
 var ErrConversationNotFound = fmt.Errorf("conversation not found")
+
+// ErrDocumentNotFound lets API handlers map to 404 without matching on
+// error text.
+var ErrDocumentNotFound = fmt.Errorf("document not found")

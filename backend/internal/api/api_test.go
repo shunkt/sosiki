@@ -1,19 +1,38 @@
 package api
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
+	"github.com/shun/kaigi/backend/internal/chat"
 	"github.com/shun/kaigi/backend/internal/config"
 )
 
+func testConfig() config.Config {
+	return config.Config{
+		Addr:           ":0",
+		AllowedOrigins: []string{"http://localhost:5173"},
+		// Deliberately unreachable so handleHealth's dependency checks fail
+		// fast and deterministically, independent of whether the
+		// docker-compose TEI containers happen to be running.
+		EmbedURL:  "http://127.0.0.1:1",
+		RerankURL: "http://127.0.0.1:1",
+	}
+}
+
 func newTestHandler() http.Handler {
-	cfg := config.Config{Addr: ":0", AllowedOrigins: []string{"http://localhost:5173"}}
-	return NewHandler(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewHandler(testConfig(), Deps{
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 }
 
 func TestHealth(t *testing.T) {
@@ -27,21 +46,11 @@ func TestHealth(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if body["status"] != "ok" {
-		t.Errorf("status field = %q, want %q", body["status"], "ok")
-	}
-}
-
-func TestHelloUsesNameQuery(t *testing.T) {
-	rec := httptest.NewRecorder()
-	newTestHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/hello?name=kaigi", nil))
-
-	var body map[string]string
-	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if want := "hello, kaigi"; body["message"] != want {
-		t.Errorf("message = %q, want %q", body["message"], want)
+	// Unreachable EmbedURL/RerankURL (see testConfig) makes "degraded" the
+	// correct answer here — a live check is exercised manually against the
+	// docker-compose stack per the plan's Task 1 VALIDATE.
+	if body["status"] != "degraded" {
+		t.Errorf("status field = %q, want %q", body["status"], "degraded")
 	}
 }
 
@@ -86,5 +95,146 @@ func TestPreflightReturnsNoContent(t *testing.T) {
 
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+}
+
+// --- SSE handler tests (Task 11) ---
+
+// fakeChatEngine drives handleSendMessage's frame-by-frame behavior without
+// a live DeepSeek/Postgres/MinIO stack.
+type fakeChatEngine struct {
+	events []chat.Event
+	err    error
+}
+
+func (f fakeChatEngine) Reply(_ context.Context, _ uuid.UUID, _ string, out chan<- chat.Event) error {
+	for _, ev := range f.events {
+		out <- ev
+	}
+	return f.err
+}
+
+func newSSETestHandler(engine fakeChatEngine) http.Handler {
+	return NewHandler(testConfig(), Deps{
+		Log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Chat: engine,
+	})
+}
+
+func TestSSEFramesAreSeparate(t *testing.T) {
+	engine := fakeChatEngine{events: []chat.Event{
+		{Type: "token", Text: "a"},
+		{Type: "token", Text: "b"},
+		{Type: "token", Text: "c"},
+	}}
+	srv := httptest.NewServer(newSSETestHandler(engine))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Post(srv.URL+"/api/conversations/"+uuid.NewString()+"/messages",
+		"application/json", strings.NewReader(`{"content":"hi"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var tokenFrames int
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "event: token") {
+			tokenFrames++
+		}
+	}
+	// If Flush weren't reaching the client (the statusRecorder.Unwrap bug
+	// this whole feature guards against), all three tokens would arrive as
+	// one frame instead of three.
+	if tokenFrames != 3 {
+		t.Errorf("got %d separate token frames, want 3", tokenFrames)
+	}
+}
+
+func TestSSEEncodesNewlinesInTokens(t *testing.T) {
+	engine := fakeChatEngine{events: []chat.Event{
+		{Type: "token", Text: "line one\nline two"},
+	}}
+	srv := httptest.NewServer(newSSETestHandler(engine))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Post(srv.URL+"/api/conversations/"+uuid.NewString()+"/messages",
+		"application/json", strings.NewReader(`{"content":"hi"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var dataLines int
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "data: ") {
+			dataLines++
+			var ev chat.Event
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(scanner.Text(), "data: ")), &ev); err != nil {
+				t.Fatalf("data line is not valid JSON (a raw newline in the token corrupted the frame): %v", err)
+			}
+		}
+	}
+	if dataLines != 1 {
+		t.Errorf("got %d data lines, want 1 (a raw newline would split it into more)", dataLines)
+	}
+}
+
+func TestSendMessageRejectsEmptyContent(t *testing.T) {
+	srv := httptest.NewServer(newSSETestHandler(fakeChatEngine{}))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Post(srv.URL+"/api/conversations/"+uuid.NewString()+"/messages",
+		"application/json", strings.NewReader(`{"content":""}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestSendMessageRejectsInvalidConversationID(t *testing.T) {
+	srv := httptest.NewServer(newSSETestHandler(fakeChatEngine{}))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Post(srv.URL+"/api/conversations/not-a-uuid/messages",
+		"application/json", strings.NewReader(`{"content":"hi"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestSSEEmitsErrorEventOnEngineFailure(t *testing.T) {
+	engine := fakeChatEngine{err: io.ErrUnexpectedEOF}
+	srv := httptest.NewServer(newSSETestHandler(engine))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Post(srv.URL+"/api/conversations/"+uuid.NewString()+"/messages",
+		"application/json", strings.NewReader(`{"content":"hi"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var gotError bool
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "event: error") {
+			gotError = true
+		}
+	}
+	if !gotError {
+		t.Error("expected an error event when the engine returns an error")
 	}
 }

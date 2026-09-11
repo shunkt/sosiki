@@ -11,7 +11,12 @@ import (
 	"time"
 
 	"github.com/shun/kaigi/backend/internal/api"
+	"github.com/shun/kaigi/backend/internal/chat"
 	"github.com/shun/kaigi/backend/internal/config"
+	"github.com/shun/kaigi/backend/internal/db"
+	"github.com/shun/kaigi/backend/internal/objectstore"
+	"github.com/shun/kaigi/backend/internal/persona"
+	"github.com/shun/kaigi/backend/internal/retrieval"
 )
 
 func main() {
@@ -24,10 +29,46 @@ func main() {
 
 func run(log *slog.Logger) error {
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		// Fail at boot, not on the first chat request: a conversation API
+		// with no LLM key configured is not a degraded service, it is a
+		// misconfigured one.
+		return err
+	}
+
+	ctx := context.Background()
+
+	pool, err := db.New(ctx, cfg.DatabaseURL, log)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	objects, err := objectstore.New(cfg.ObjectStore)
+	if err != nil {
+		return err
+	}
+
+	embedder := retrieval.NewEmbedder(cfg.EmbedURL)
+	reranker := retrieval.NewReranker(cfg.RerankURL)
+	searcher := retrieval.NewSearcher(pool, embedder, reranker, cfg.Retrieval)
+
+	personas := persona.NewStore(pool, embedder)
+	chatStore := chat.NewStore(pool)
+	llm := chat.NewDeepSeekClient(cfg.LLM)
+	engine := chat.NewEngine(llm, searcher, objects, chatStore, cfg)
+
+	handler := api.NewHandler(cfg, api.Deps{
+		Log:       log,
+		Personas:  personas,
+		Chat:      engine,
+		ChatStore: chatStore,
+		Objects:   objects,
+	})
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           api.NewHandler(cfg, log),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		// ReadTimeout and WriteTimeout stay unset. Both are absolute deadlines on
 		// the entire request/response, so either one would cut an SSE stream off
@@ -45,13 +86,13 @@ func run(log *slog.Logger) error {
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	stopCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	select {
 	case err := <-errCh:
 		return err
-	case <-ctx.Done():
+	case <-stopCtx.Done():
 		log.Info("shutting down")
 	}
 
