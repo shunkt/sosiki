@@ -29,30 +29,25 @@ type Candidate struct {
 	SizeBytes  int64
 	Embedding  []float32
 
-	Relevance float32 // cross-encoder score, roughly 0..1
+	Relevance float32 // cosine similarity to the nearest query, 0..1 in practice
 	Affinity  float32 // persona interest match, -1..1
 	Final     float32 // blended score used for ordering
 }
 
-// queryEmbedder and crossEncoder are narrow seams over Embedder and Reranker
-// so tests can drive the blend/threshold logic without a live TEI server.
+// queryEmbedder is the narrow seam over Embedder so tests can drive the
+// blend/threshold logic without a live embeddings API.
 type queryEmbedder interface {
 	EmbedQueries(ctx context.Context, texts []string) ([][]float32, error)
-}
-
-type crossEncoder interface {
-	Rerank(ctx context.Context, query string, texts []string) ([]RerankResult, error)
 }
 
 type Searcher struct {
 	pool     *pgxpool.Pool
 	embedder queryEmbedder
-	reranker crossEncoder
 	cfg      config.RetrievalConfig
 }
 
-func NewSearcher(pool *pgxpool.Pool, embedder *Embedder, reranker *Reranker, cfg config.RetrievalConfig) *Searcher {
-	return &Searcher{pool: pool, embedder: embedder, reranker: reranker, cfg: cfg}
+func NewSearcher(pool *pgxpool.Pool, embedder *Embedder, cfg config.RetrievalConfig) *Searcher {
+	return &Searcher{pool: pool, embedder: embedder, cfg: cfg}
 }
 
 // Search runs the persona-weighted retrieval pipeline for one or more
@@ -79,7 +74,13 @@ func (s *Searcher) Search(ctx context.Context, p persona.Persona, queries []stri
 		for _, row := range rows {
 			if prev, ok := bestDistance[row.candidate.ChunkID]; !ok || row.distance < prev {
 				bestDistance[row.candidate.ChunkID] = row.distance
-				byChunk[row.candidate.ChunkID] = row.candidate
+				c := row.candidate
+				// pgvector's <=> is cosine distance (1 - similarity). With a
+				// cross-encoder gone, this similarity is the only relevance
+				// signal left, so it is what the skepticism threshold now
+				// filters on.
+				c.Relevance = float32(1 - row.distance)
+				byChunk[row.candidate.ChunkID] = c
 			}
 		}
 	}
@@ -93,41 +94,21 @@ func (s *Searcher) Search(ctx context.Context, p persona.Persona, queries []stri
 		candidates = append(candidates, c)
 	}
 
-	return rerankAndBlend(ctx, s.reranker, p, s.cfg, queries[0], candidates)
+	return blend(p, s.cfg, candidates), nil
 }
 
-// rerankAndBlend applies the persona-weighted rerank to already-retrieved
-// candidates. Split out from Search so the blend and threshold math — the
-// core of what makes this persona-aware — can be unit tested with a fake
-// crossEncoder and no live Postgres.
-func rerankAndBlend(
-	ctx context.Context, reranker crossEncoder, p persona.Persona, cfg config.RetrievalConfig,
-	primaryQuery string, candidates []Candidate,
-) ([]Candidate, error) {
+// blend applies the persona weighting to already-retrieved candidates. Split
+// out from Search so the blend and threshold math — the core of what makes
+// this persona-aware — can be unit tested without a live Postgres.
+func blend(p persona.Persona, cfg config.RetrievalConfig, candidates []Candidate) []Candidate {
 	if len(candidates) == 0 {
-		return nil, nil
-	}
-
-	// Rerank against the first (primary) rewritten query. Later queries only
-	// widen recall; the persona's leading intent still drives ranking.
-	texts := make([]string, len(candidates))
-	for i, c := range candidates {
-		texts[i] = c.Content
-	}
-	scores, err := reranker.Rerank(ctx, primaryQuery, texts)
-	if err != nil {
-		return nil, fmt.Errorf("search: rerank: %w", err)
-	}
-	for _, sc := range scores {
-		c := candidates[sc.Index]
-		c.Relevance = sc.Score
-		candidates[sc.Index] = c
+		return nil
 	}
 
 	// A more skeptical persona demands stronger relevance before citing
 	// anything — the threshold rises with Skepticism rather than the other
 	// way around, so a credulous persona (0) still filters obvious noise.
-	threshold := 0.15 + 0.45*p.Personality.Skepticism
+	threshold := float32(cfg.RelevanceFloor + cfg.SkepticismSpan*float64(p.Personality.Skepticism))
 	filtered := candidates[:0]
 	for _, c := range candidates {
 		if c.Relevance >= threshold {
@@ -136,7 +117,7 @@ func rerankAndBlend(
 	}
 	candidates = filtered
 	if len(candidates) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	for i, c := range candidates {
@@ -155,7 +136,7 @@ func rerankAndBlend(
 	if n := cfg.FinalN; n > 0 && len(candidates) > n {
 		candidates = candidates[:n]
 	}
-	return candidates, nil
+	return candidates
 }
 
 // affinity blends a chunk's alignment with each interest, weighted, then

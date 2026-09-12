@@ -7,10 +7,10 @@ setup: ## Install all dependencies
 	cd frontend && npm install
 	cd backend && go mod download
 
-up: ## Start postgres/MinIO/TEI via docker compose and wait for them to be healthy
+up: ## Start postgres/MinIO via docker compose and wait for them to be healthy
 	docker compose up -d
-	@echo "waiting for dependencies to become healthy (first run downloads ~2.5GB of models)..."
-	@until [ "$$(docker compose ps --format '{{.Health}}' postgres minio tei-embed tei-rerank 2>/dev/null | grep -cv healthy)" = "0" ]; do sleep 5; done
+	@echo "waiting for dependencies to become healthy..."
+	@until [ "$$(docker compose ps --format '{{.Health}}' postgres minio 2>/dev/null | grep -cv healthy)" = "0" ]; do sleep 5; done
 	@echo "all dependencies healthy"
 
 down: ## Stop docker compose services

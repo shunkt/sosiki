@@ -24,7 +24,7 @@ func testPersona() persona.Persona {
 	}
 }
 
-// TestBuildSystemPromptIsStable guards the DeepSeek automatic-caching
+// TestBuildSystemPromptIsStable guards the OpenAI automatic-caching
 // contract: the same persona must render to byte-identical prompts across
 // calls, since nothing marks a cache boundary explicitly — a stable prefix
 // is the only lever.
@@ -66,7 +66,7 @@ func (f fakeLLM) CreateChatCompletionStream(context.Context, ChatRequest) (ChatS
 
 func TestRewriteQueriesParsesJSON(t *testing.T) {
 	llm := fakeLLM{completion: ChatResponse{Content: `{"queries": ["合意形成", "Raft"]}`}}
-	got := RewriteQueries(context.Background(), llm, "deepseek-flash", testPersona(), nil, "合意形成について")
+	got := RewriteQueries(context.Background(), llm, "gpt-5-mini", testPersona(), nil, "合意形成について")
 	want := []string{"合意形成", "Raft"}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Errorf("got %v, want %v", got, want)
@@ -75,7 +75,7 @@ func TestRewriteQueriesParsesJSON(t *testing.T) {
 
 func TestRewriteQueriesFallsBackOnError(t *testing.T) {
 	llm := fakeLLM{completeErr: errors.New("boom")}
-	got := RewriteQueries(context.Background(), llm, "deepseek-flash", testPersona(), nil, "元の発話")
+	got := RewriteQueries(context.Background(), llm, "gpt-5-mini", testPersona(), nil, "元の発話")
 	if len(got) != 1 || got[0] != "元の発話" {
 		t.Errorf("got %v, want fallback to the raw utterance", got)
 	}
@@ -83,7 +83,7 @@ func TestRewriteQueriesFallsBackOnError(t *testing.T) {
 
 func TestRewriteQueriesFallsBackOnInvalidJSON(t *testing.T) {
 	llm := fakeLLM{completion: ChatResponse{Content: "not json at all"}}
-	got := RewriteQueries(context.Background(), llm, "deepseek-flash", testPersona(), nil, "元の発話")
+	got := RewriteQueries(context.Background(), llm, "gpt-5-mini", testPersona(), nil, "元の発話")
 	if len(got) != 1 || got[0] != "元の発話" {
 		t.Errorf("got %v, want fallback to the raw utterance", got)
 	}
@@ -93,7 +93,7 @@ func TestRewriteQueriesCapsAtMax(t *testing.T) {
 	llm := fakeLLM{completion: ChatResponse{
 		Content: `{"queries": ["a", "b", "c", "d", "e"]}`,
 	}}
-	got := RewriteQueries(context.Background(), llm, "deepseek-flash", testPersona(), nil, "x")
+	got := RewriteQueries(context.Background(), llm, "gpt-5-mini", testPersona(), nil, "x")
 	if len(got) != maxRewrittenQueries {
 		t.Errorf("got %d queries, want capped at %d", len(got), maxRewrittenQueries)
 	}

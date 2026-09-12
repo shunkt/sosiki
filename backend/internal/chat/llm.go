@@ -44,9 +44,9 @@ type ChatStream interface {
 	Close() error
 }
 
-// LLMClient is the seam over the OpenAI-compatible DeepSeek client, kept
-// narrow so the engine's and prompt-rewriter's tests can drive a fake
-// implementation without a live API key.
+// LLMClient is the seam over the OpenAI chat client, kept narrow so the
+// engine's and prompt-rewriter's tests can drive a fake implementation
+// without a live API key.
 type LLMClient interface {
 	CreateChatCompletion(ctx context.Context, req ChatRequest) (ChatResponse, error)
 	CreateChatCompletionStream(ctx context.Context, req ChatRequest) (ChatStream, error)

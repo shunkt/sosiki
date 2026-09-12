@@ -20,8 +20,8 @@ import (
 
 // The interfaces below are narrow seams over Store, retrieval.Searcher, and
 // objectstore.Store — the same pattern retrieval.Searcher uses for its own
-// TEI clients — so Reply's event ordering (sources -> token* -> done) can be
-// unit tested with fakes and no live Postgres or MinIO.
+// embeddings client — so Reply's event ordering (sources -> token* -> done)
+// can be unit tested with fakes and no live Postgres or MinIO.
 type conversationStore interface {
 	PersonaFor(ctx context.Context, conversationID uuid.UUID) (persona.Persona, error)
 	History(ctx context.Context, conversationID uuid.UUID, limit int) ([]Message, error)
@@ -120,7 +120,7 @@ func (e *Engine) Reply(ctx context.Context, conversationID uuid.UUID, utterance 
 		messages = append(messages, ChatMessage{Role: m.Role, Content: m.Content})
 	}
 	// The documents block rides in the user turn, not system: system stays
-	// byte-identical across turns (see BuildSystemPrompt) so DeepSeek's
+	// byte-identical across turns (see BuildSystemPrompt) so OpenAI's
 	// automatic prefix caching keeps working; putting per-turn content there
 	// would invalidate the cache on every message.
 	messages = append(messages, ChatMessage{Role: "user", Content: expanded + utterance})

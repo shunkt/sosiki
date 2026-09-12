@@ -21,12 +21,13 @@ type Config struct {
 	// ObjectStore holds the S3-compatible (MinIO) connection.
 	ObjectStore ObjectStoreConfig
 
-	// EmbedURL and RerankURL are Text Embeddings Inference base URLs. TEI
-	// serves one model per process, so these are separate hosts.
-	EmbedURL  string
-	RerankURL string
+	// Embed points the OpenAI embeddings client at a model whose output width
+	// must match vector(1536) in SQL — see retrieval.Dimensions.
+	Embed EmbedConfig
 
-	// LLM points an OpenAI-compatible client at DeepSeek.
+	// LLM is the OpenAI chat client. Embed and LLM carry the same BaseURL and
+	// APIKey by default; they stay separate structs so each client constructor
+	// takes only what it needs.
 	LLM LLMConfig
 
 	// Retrieval tunes the persona-weighted rerank.
@@ -45,10 +46,19 @@ type ObjectStoreConfig struct {
 	UseSSL         bool
 }
 
-// LLMConfig targets DeepSeek through an OpenAI-compatible client. DeepSeek
-// publishes no Go SDK of its own, so the OpenAI client with a swapped base URL
-// is the supported path.
+// LLMConfig targets OpenAI's chat completions API. BaseURL stays
+// configurable so an OpenAI-compatible gateway can be swapped in without
+// a rebuild.
 type LLMConfig struct {
+	BaseURL string
+	APIKey  string
+	Model   string
+}
+
+// EmbedConfig targets the OpenAI embeddings API. Model must be a
+// text-embedding-3 family model: the request always sends the dimensions
+// parameter, which older models (ada-002) reject.
+type EmbedConfig struct {
 	BaseURL string
 	APIKey  string
 	Model   string
@@ -64,6 +74,13 @@ type RetrievalConfig struct {
 	PersonaInfluence float64
 	// ContextPadBytes is how far either side of a chunk the Range GET reads.
 	ContextPadBytes int
+	// RelevanceFloor and SkepticismSpan define the minimum cosine similarity a
+	// chunk needs before it can be cited: floor + span*Skepticism. They are
+	// tunable because the right values depend on the embedding model's score
+	// distribution over the corpus, which only measurement settles — the
+	// defaults are calibrated for text-embedding-3-small over Japanese prose.
+	RelevanceFloor float64
+	SkepticismSpan float64
 }
 
 func Load() Config {
@@ -80,19 +97,23 @@ func Load() Config {
 			Bucket:         env("MINIO_BUCKET", "kaigi-knowledge"),
 			UseSSL:         envBool("MINIO_USE_SSL", false),
 		},
-		EmbedURL:  env("EMBED_URL", "http://localhost:8081"),
-		RerankURL: env("RERANK_URL", "http://localhost:8082"),
+		Embed: EmbedConfig{
+			BaseURL: env("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+			APIKey:  env("OPENAI_API_KEY", ""),
+			Model:   env("EMBED_MODEL", "text-embedding-3-small"),
+		},
 		LLM: LLMConfig{
-			BaseURL: env("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-			APIKey:  env("DEEPSEEK_API_KEY", ""),
-			// deepseek-v4-flash is a retired alias; do not depend on its routing.
-			Model: env("CHAT_MODEL", "deepseek-flash"),
+			BaseURL: env("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+			APIKey:  env("OPENAI_API_KEY", ""),
+			Model:   env("CHAT_MODEL", "gpt-5-mini"),
 		},
 		Retrieval: RetrievalConfig{
 			CandidateK:       envInt("CANDIDATE_K", 40),
 			FinalN:           envInt("FINAL_N", 8),
 			PersonaInfluence: envFloat("PERSONA_INFLUENCE", 0.25),
 			ContextPadBytes:  envInt("CONTEXT_PAD_BYTES", 1200),
+			RelevanceFloor:   envFloat("RELEVANCE_FLOOR", 0.25),
+			SkepticismSpan:   envFloat("RELEVANCE_SKEPTICISM_SPAN", 0.20),
 		},
 	}
 }
@@ -102,7 +123,7 @@ func Load() Config {
 // rather than a 500 on the first message.
 func (c Config) Validate() error {
 	if c.LLM.APIKey == "" {
-		return fmt.Errorf("DEEPSEEK_API_KEY is required")
+		return fmt.Errorf("OPENAI_API_KEY is required")
 	}
 	if c.Retrieval.PersonaInfluence < 0 || c.Retrieval.PersonaInfluence > 1 {
 		return fmt.Errorf("PERSONA_INFLUENCE must be within 0..1, got %v",
@@ -111,6 +132,10 @@ func (c Config) Validate() error {
 	if c.Retrieval.FinalN > c.Retrieval.CandidateK {
 		return fmt.Errorf("FINAL_N (%d) cannot exceed CANDIDATE_K (%d)",
 			c.Retrieval.FinalN, c.Retrieval.CandidateK)
+	}
+	if c.Retrieval.RelevanceFloor < 0 || c.Retrieval.RelevanceFloor > 1 {
+		return fmt.Errorf("RELEVANCE_FLOOR must be within 0..1, got %v",
+			c.Retrieval.RelevanceFloor)
 	}
 	return nil
 }

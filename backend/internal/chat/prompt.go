@@ -11,7 +11,7 @@ import (
 )
 
 // BuildSystemPrompt renders the persona's personality into the stable prefix
-// of every request in a conversation. DeepSeek caches automatically on a
+// of every request in a conversation. OpenAI caches automatically on a
 // matching prefix — there is no explicit cache_control — so this string must
 // be byte-identical across turns for the same persona: no timestamps, no
 // conversation ID, nothing that varies.
@@ -59,7 +59,7 @@ func BuildSystemPrompt(p persona.Persona) string {
 	return b.String()
 }
 
-// rewriteQueriesJSON is the shape DeepSeek's JSON Output is asked to produce.
+// rewriteQueriesJSON is the shape OpenAI's JSON Output is asked to produce.
 // The exact response_format parameter and json_schema support are unverified
 // (see the plan's Notes) — the shape is enforced by parsing, not by a schema,
 // so a malformed response degrades to the fallback below rather than erroring.

@@ -8,11 +8,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -57,7 +60,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("seed: new minio client: %w", err)
 	}
 
-	embedder := retrieval.NewEmbedder(cfg.EmbedURL)
+	embedder := retrieval.NewEmbedder(cfg.Embed)
 	personas := persona.NewStore(pool, embedder)
 
 	if err := seedDocuments(ctx, log, pool, minioClient, embedder, cfg.ObjectStore.Bucket); err != nil {
@@ -208,19 +211,35 @@ func seedPersonas(ctx context.Context, log *slog.Logger, pool *pgxpool.Pool, per
 	}
 
 	for _, spec := range specs {
-		var exists bool
-		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM personas WHERE name = $1)`, spec.Name).
-			Scan(&exists); err != nil {
+		var id uuid.UUID
+		var interestCount int
+		err := pool.QueryRow(ctx, `
+			SELECT p.id, count(i.id)
+			FROM personas p
+			LEFT JOIN persona_interests i ON i.persona_id = p.id
+			WHERE p.name = $1
+			GROUP BY p.id
+		`, spec.Name).Scan(&id, &interestCount)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			if _, err := personas.Create(ctx, spec); err != nil {
+				return fmt.Errorf("create persona %s: %w", spec.Name, err)
+			}
+			log.Info("seeded persona", "name", spec.Name)
+		case err != nil:
 			return fmt.Errorf("check persona %s: %w", spec.Name, err)
-		}
-		if exists {
+		case interestCount == len(spec.Interests):
 			log.Info("persona already seeded, skipping", "name", spec.Name)
-			continue
+		default:
+			// Interests went missing (migration 0002 empties them when the
+			// embedding width changes). Re-embed rather than skip: a persona
+			// with no interests scores every chunk identically.
+			if err := personas.ReplaceInterests(ctx, id, spec.Interests); err != nil {
+				return fmt.Errorf("replace interests for %s: %w", spec.Name, err)
+			}
+			log.Info("re-embedded persona interests", "name", spec.Name,
+				"had", interestCount, "want", len(spec.Interests))
 		}
-		if _, err := personas.Create(ctx, spec); err != nil {
-			return fmt.Errorf("create persona %s: %w", spec.Name, err)
-		}
-		log.Info("seeded persona", "name", spec.Name)
 	}
 	return nil
 }

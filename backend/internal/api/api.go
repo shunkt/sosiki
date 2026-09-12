@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shun/kaigi/backend/internal/chat"
 	"github.com/shun/kaigi/backend/internal/config"
@@ -18,7 +19,7 @@ import (
 
 // chatEngine is the one seam interfaced here (satisfied by *chat.Engine):
 // the SSE handler's frame-by-frame behavior needs to be testable without a
-// live DeepSeek/Postgres/MinIO stack. Personas/ChatStore/Objects stay
+// live OpenAI/Postgres/MinIO stack. Personas/ChatStore/Objects stay
 // concrete — their handlers are covered by the integration tests already
 // established for their packages (persona, chat, objectstore), not fakes.
 type chatEngine interface {
@@ -28,6 +29,7 @@ type chatEngine interface {
 // Deps are the dependencies NewHandler wires into routes.
 type Deps struct {
 	Log       *slog.Logger
+	Pool      *pgxpool.Pool
 	Personas  *persona.Store
 	Chat      chatEngine
 	ChatStore *chat.Store
@@ -60,8 +62,8 @@ func NewHandler(cfg config.Config, d Deps) http.Handler {
 	return requestLogger(d.Log, cors(cfg.AllowedOrigins, mux))
 }
 
-// healthCheckTimeout bounds each dependency probe so a stalled TEI cannot
-// hang the whole health check indefinitely.
+// healthCheckTimeout bounds the dependency probe so a stalled database
+// cannot hang the whole health check indefinitely.
 const healthCheckTimeout = 2 * time.Second
 
 func (h *handlers) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -71,27 +73,25 @@ func (h *handlers) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// 5xx: the process itself is healthy even if a downstream isn't, and a
 	// failing health check must not be what takes the container down.
 	degraded := false
-	check := func(name, url string) {
+
+	// The embedding and chat providers are not probed: both are third-party
+	// HTTP APIs with no free liveness endpoint, and billing a request per
+	// health check to learn something the next real request reports anyway
+	// is not a trade worth making.
+	switch {
+	case h.deps.Pool == nil:
+		status["db"] = "unconfigured"
+		degraded = true
+	default:
 		ctx, cancel := context.WithTimeout(r.Context(), healthCheckTimeout)
 		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			status[name] = "error"
+		if err := h.deps.Pool.Ping(ctx); err != nil {
+			status["db"] = "unreachable"
 			degraded = true
-			return
+		} else {
+			status["db"] = "ok"
 		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil || resp.StatusCode != http.StatusOK {
-			status[name] = "unreachable"
-			degraded = true
-			return
-		}
-		_ = resp.Body.Close()
-		status[name] = "ok"
 	}
-
-	check("embed", h.cfg.EmbedURL+"/health")
-	check("rerank", h.cfg.RerankURL+"/health")
 
 	if degraded {
 		status["status"] = "degraded"

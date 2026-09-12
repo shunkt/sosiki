@@ -201,6 +201,43 @@ func (s *Store) Update(ctx context.Context, id uuid.UUID, in UpdateInput) (Perso
 	return s.Get(ctx, id)
 }
 
+// ReplaceInterests re-embeds and rewrites a persona's interest axes. It
+// exists for the embedding-model migration path: migration 0002 empties
+// persona_interests because 768-dimension vectors cannot be converted to
+// 1536, and without this the seeder — which skips personas that already
+// exist by name — would leave them with no interests at all, silently
+// degenerating the persona-weighted rerank into plain RAG.
+func (s *Store) ReplaceInterests(ctx context.Context, id uuid.UUID, in []InterestInput) error {
+	interests, err := s.embedInterests(ctx, in)
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("persona: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM persona_interests WHERE persona_id = $1`, id,
+	); err != nil {
+		return fmt.Errorf("persona: delete interests: %w", err)
+	}
+	for _, it := range interests {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO persona_interests (persona_id, topic, weight, embedding)
+			VALUES ($1, $2, $3, $4)
+		`, id, it.Topic, it.Weight, pgvector.NewVector(it.Embedding)); err != nil {
+			return fmt.Errorf("persona: insert interest: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("persona: commit: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) interests(ctx context.Context, personaID uuid.UUID) ([]Interest, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT topic, weight, embedding FROM persona_interests WHERE persona_id = $1

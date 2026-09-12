@@ -66,7 +66,7 @@ func (fakeObjects) PresignedURL(context.Context, string, time.Duration) (string,
 
 // fakeLLMStream drives the engine's streaming loop with a scripted sequence
 // of chunks, so tests control exactly what CreateChatCompletionStream sees
-// without a live DeepSeek connection.
+// without a live OpenAI connection.
 type fakeLLMStream struct {
 	llm     ChatResponse // used for RewriteQueries's non-streaming call
 	chunks  []ChatStreamChunk
@@ -98,7 +98,7 @@ func (f *fakeLLMStream) Close() error { return nil }
 
 func testEngine(llm *fakeLLMStream, store *fakeStore, cands []retrieval.Candidate) *Engine {
 	e := NewEngine(llm, nil, nil, nil, config.Config{
-		LLM:       config.LLMConfig{Model: "deepseek-flash"},
+		LLM:       config.LLMConfig{Model: "gpt-5-mini"},
 		Retrieval: config.RetrievalConfig{ContextPadBytes: 100},
 	})
 	e.searcher = fakeSearcher{candidates: cands}

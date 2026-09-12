@@ -49,17 +49,17 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	embedder := retrieval.NewEmbedder(cfg.EmbedURL)
-	reranker := retrieval.NewReranker(cfg.RerankURL)
-	searcher := retrieval.NewSearcher(pool, embedder, reranker, cfg.Retrieval)
+	embedder := retrieval.NewEmbedder(cfg.Embed)
+	searcher := retrieval.NewSearcher(pool, embedder, cfg.Retrieval)
 
 	personas := persona.NewStore(pool, embedder)
 	chatStore := chat.NewStore(pool)
-	llm := chat.NewDeepSeekClient(cfg.LLM)
+	llm := chat.NewOpenAIClient(cfg.LLM)
 	engine := chat.NewEngine(llm, searcher, objects, chatStore, cfg)
 
 	handler := api.NewHandler(cfg, api.Deps{
 		Log:       log,
+		Pool:      pool,
 		Personas:  personas,
 		Chat:      engine,
 		ChatStore: chatStore,

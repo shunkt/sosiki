@@ -52,61 +52,6 @@ services:
         echo "bucket kaigi-knowledge ready"
     restart: "no"
 
-  # TEI serves exactly one model per process, so embedding and reranking need
-  # separate containers. They share the HF cache volume so the ~2.5GB of weights
-  # is downloaded once and survives `docker compose down`.
-  tei-embed:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
-    platform: linux/amd64
-    command:
-      - --model-id
-      - cl-nagoya/ruri-v3-310m
-      - --pooling
-      - mean
-      - --auto-truncate
-      # Defaults (max-batch-tokens=16384, max-client-batch-size=32) size
-      # warmup buffers for production throughput. Under amd64 emulation on
-      # Apple Silicon that blew past 11GB and got OOM-killed before ever
-      # reaching /health. This is single-user dev traffic — a far smaller
-      # batch is plenty and keeps warmup inside a few hundred MB.
-      - --max-batch-tokens
-      - "2048"
-      - --max-client-batch-size
-      - "8"
-    ports:
-      - "8081:80"
-    volumes:
-      - hf-cache:/data
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 90
-      start_period: 60s
-
-  tei-rerank:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
-    platform: linux/amd64
-    command:
-      - --model-id
-      - cl-nagoya/ruri-v3-reranker-310m
-      - --auto-truncate
-      - --max-batch-tokens
-      - "2048"
-      - --max-client-batch-size
-      - "8"
-    ports:
-      - "8082:80"
-    volumes:
-      - hf-cache:/data
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 90
-      start_period: 60s
-
 volumes:
   postgres-data:
   minio-data:
-  hf-cache:

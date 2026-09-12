@@ -43,8 +43,11 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	`).Scan(&columnType); err != nil {
 		t.Fatalf("check chunks.embedding type: %v", err)
 	}
-	if columnType != "vector(768)" {
-		t.Errorf("chunks.embedding is %q, want vector(768)", columnType)
+	// 1536 is text-embedding-3-small's width, set by migration 0002. This
+	// assertion is what catches a migration that half-applied: 768 here means
+	// 0002 never ran, and the first INSERT of a real embedding would fail.
+	if columnType != "vector(1536)" {
+		t.Errorf("chunks.embedding is %q, want vector(1536)", columnType)
 	}
 
 	var indexExists bool

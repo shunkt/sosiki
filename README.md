@@ -11,12 +11,12 @@
   POST /api/           │           chat.Engine                    │
   conversations/{id}/  │                                          │
   messages  ────────▶  │ 1. 履歴ロード       ────▶ Postgres       │
-       (SSE)           │ 2. クエリ書き換え   ──▶ DeepSeek(JSON出力) │
+       (SSE)           │ 2. クエリ書き換え   ──▶ OpenAI(JSON出力)  │
        ◀────token───   │ 3. ベクトル検索     ────▶ pgvector        │
-       ◀────token───   │ 4. リランキング     ────▶ TEI /rerank     │
-       ◀────sources──  │    + 性格の関心スコア                     │
+       ◀────token───   │ 4. 性格重み付け     ──── (コサイン類似度   │
+       ◀────sources──  │    + 性格の関心スコア      + affinity)    │
        ◀────done─────  │ 5. コンテキスト拡張 ────▶ MinIO(Range GET) │
-                       │ 6. 生成            ──▶ DeepSeek(streaming)│
+                       │ 6. 生成            ──▶ OpenAI(streaming) │
                        │ 7. 保存            ────▶ Postgres        │
                        └─────────────────────────────────────────┘
 ```
@@ -25,16 +25,16 @@
 
 | 段階 | 性格のどの要素が効くか | 実装 |
 |---|---|---|
-| **① クエリ書き換え** | `Stance` + `Interests` | ペルソナが実際にどう検索するかを DeepSeek に JSON 出力で考えさせ、最大3本のクエリに展開する |
-| **② リランキング** | `Interests`（重み付き） + `Skepticism` | `Final = (1-λ)·Relevance + λ·Affinity`。`Affinity` は関心トピック埋め込みとチャンクの cosine 加重和。`Skepticism` が高いほど、リランク関連度の足切り閾値が上がる（採用する資料そのものが変わる） |
-| **③ 生成** | `Stance` + `Verbosity` + `Skepticism` | システムプロンプトを組み立てる。ペルソナごとに内容が固定なので、DeepSeek の自動コンテキストキャッシュが効く |
+| **① クエリ書き換え** | `Stance` + `Interests` | ペルソナが実際にどう検索するかを OpenAI に JSON 出力で考えさせ、最大3本のクエリに展開する |
+| **② 性格重み付け** | `Interests`（重み付き） + `Skepticism` | `Final = (1-λ)·Relevance + λ·Affinity`。`Relevance` は pgvector のコサイン類似度、`Affinity` は関心トピック埋め込みとチャンクの cosine 加重和。`Skepticism` が高いほど、関連度の足切り閾値が上がる（採用する資料そのものが変わる） |
+| **③ 生成** | `Stance` + `Verbosity` + `Skepticism` | システムプロンプトを組み立てる。ペルソナごとに内容が固定なので、OpenAI の自動コンテキストキャッシュが効く |
 
 `PERSONA_INFLUENCE`（λ）は環境変数。`0` で純粋な RAG に退化するので、性格の効きを A/B できる。
 
 ## レイアウト
 
 ```
-docker-compose.yml     postgres+pgvector / MinIO / TEI(embed) / TEI(rerank)
+docker-compose.yml     postgres+pgvector / MinIO
 frontend/               Vite + React + TypeScript
   src/api/client.ts     ペルソナ/会話 API の型付きクライアント、SSE ストリーム
   src/App.tsx           チャット UI
@@ -45,28 +45,26 @@ backend/
   internal/config/       環境変数ベースの設定
   internal/db/           pgxpool + 埋め込みマイグレータ
   internal/persona/      ペルソナのドメイン型と永続化
-  internal/retrieval/    TEI クライアント、pgvector 検索、性格重み付きリランキング
+  internal/retrieval/    OpenAI 埋め込みクライアント、pgvector 検索、性格重み付きランキング
   internal/objectstore/  MinIO クライアント（Range GET によるコンテキスト拡張）
-  internal/chat/         RAG オーケストレーション、システムプロンプト組み立て、DeepSeek ストリーミング
+  internal/chat/         RAG オーケストレーション、システムプロンプト組み立て、OpenAI ストリーミング
 ```
 
 ## 要件
 
 - Node 20+（開発は 26）と npm
 - Go 1.22+（開発は 1.26）— ルーティングは `net/http` のメソッド付きパターンでルータ依存なし
-- Docker（postgres+pgvector / MinIO / TEI を動かす）
-- DeepSeek の API キー（<https://platform.deepseek.com/>）
+- Docker（postgres+pgvector / MinIO を動かす）
+- OpenAI の API キー（<https://platform.openai.com/api-keys>）
 
 ## はじめかた
 
 ```sh
 cp .env.example .env
-# .env を開き DEEPSEEK_API_KEY を設定する
+# .env を開き OPENAI_API_KEY を設定する
 
 make setup   # npm install + go mod download
 make up      # docker compose up -d、依存が healthy になるまで待つ
-             # 初回は ruri-v3 の埋め込み/リランカーモデル(計 ~2.5GB)を
-             # ダウンロードするため数分かかる
 make seed    # サンプル文書3件とペルソナ2体（批評家/実務家）を投入
 make dev     # Go API を :8080、Vite を :5173 で起動（up は自動実行される）
 ```
@@ -79,7 +77,7 @@ make dev     # Go API を :8080、Vite を :5173 で起動（up は自動実行�
 
 | Method | Path                                | 説明 |
 | ------ | ----------------------------------- | --- |
-| GET    | `/api/health`                       | `{"status":"ok\|degraded","embed":"ok","rerank":"ok"}` |
+| GET    | `/api/health`                       | `{"status":"ok\|degraded","db":"ok"}` |
 | GET    | `/api/personas`                     | ペルソナ一覧 |
 | POST   | `/api/personas`                     | ペルソナ作成（関心トピックは作成時に埋め込まれる） |
 | GET    | `/api/personas/{id}`                | ペルソナ取得 |
@@ -127,15 +125,16 @@ cd backend && go test ./internal/retrieval/... -run TestSearchAgainstPostgres -v
 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | `minioadmin` | backend, seed |
 | `MINIO_BUCKET` | `kaigi-knowledge` | backend, seed |
 | `MINIO_USE_SSL` | `false` | backend |
-| `EMBED_URL` | `http://localhost:8081` | backend, seed（TEI 埋め込み） |
-| `RERANK_URL` | `http://localhost:8082` | backend（TEI リランカー） |
-| `DEEPSEEK_API_KEY` | （必須、既定なし） | backend。未設定だと起動時に失敗する |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | backend |
-| `CHAT_MODEL` | `deepseek-flash` | backend |
+| `OPENAI_API_KEY` | （必須、既定なし） | backend, seed（chat + embedding 共用）。未設定だと起動時に失敗する |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | backend, seed |
+| `CHAT_MODEL` | `gpt-5-mini` | backend |
+| `EMBED_MODEL` | `text-embedding-3-small` | backend, seed。`vector(1536)` と幅が一致する text-embedding-3 系であること |
 | `CANDIDATE_K` | `40` | backend（pgvector から取る候補数） |
-| `FINAL_N` | `8` | backend（リランク後にプロンプトへ載せる件数） |
+| `FINAL_N` | `8` | backend（性格重み付け後にプロンプトへ載せる件数） |
 | `PERSONA_INFLUENCE` | `0.25` | backend（性格の効き具合 λ、0..1） |
 | `CONTEXT_PAD_BYTES` | `1200` | backend（MinIO Range GET でチャンク前後に読み足すバイト数） |
+| `RELEVANCE_FLOOR` | `0.25` | backend（引用に必要な最低コサイン類似度） |
+| `RELEVANCE_SKEPTICISM_SPAN` | `0.20` | backend（`Skepticism` に応じて閾値が上乗せされる幅） |
 | `VITE_API_PROXY_TARGET` | `http://localhost:8080` | frontend |
 
 開発時は Vite のプロキシによりブラウザからは単一オリジンにしか見えないため CORS は経由しない。`ALLOWED_ORIGINS` はフロントエンドを別ホストから配信する場合に効く。

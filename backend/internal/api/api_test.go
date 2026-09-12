@@ -21,14 +21,12 @@ func testConfig() config.Config {
 	return config.Config{
 		Addr:           ":0",
 		AllowedOrigins: []string{"http://localhost:5173"},
-		// Deliberately unreachable so handleHealth's dependency checks fail
-		// fast and deterministically, independent of whether the
-		// docker-compose TEI containers happen to be running.
-		EmbedURL:  "http://127.0.0.1:1",
-		RerankURL: "http://127.0.0.1:1",
 	}
 }
 
+// newTestHandler wires no Pool, so handleHealth reports db as
+// "unconfigured" and the overall status as "degraded". A live probe is
+// exercised manually against the docker-compose stack.
 func newTestHandler() http.Handler {
 	return NewHandler(testConfig(), Deps{
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -46,9 +44,9 @@ func TestHealth(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	// Unreachable EmbedURL/RerankURL (see testConfig) makes "degraded" the
-	// correct answer here — a live check is exercised manually against the
-	// docker-compose stack per the plan's Task 1 VALIDATE.
+	// No Pool wired (see newTestHandler) makes "degraded" the correct answer
+	// here — a live check is exercised manually against the docker-compose
+	// stack per the plan's Task 1 VALIDATE.
 	if body["status"] != "degraded" {
 		t.Errorf("status field = %q, want %q", body["status"], "degraded")
 	}
@@ -101,7 +99,7 @@ func TestPreflightReturnsNoContent(t *testing.T) {
 // --- SSE handler tests (Task 11) ---
 
 // fakeChatEngine drives handleSendMessage's frame-by-frame behavior without
-// a live DeepSeek/Postgres/MinIO stack.
+// a live OpenAI/Postgres/MinIO stack.
 type fakeChatEngine struct {
 	events []chat.Event
 	err    error
