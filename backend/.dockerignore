@@ -1,0 +1,17 @@
+# Build output. bin/ is the Makefile's target; a stray ./seed or ./server can
+# be left behind by a manual `go build` and must never shadow the binaries
+# produced inside the image.
+bin/
+seed
+server
+
+# Test artifacts
+*.test
+coverage.out
+
+# Docker's own inputs are not build inputs.
+Dockerfile
+.dockerignore
+
+# testdata/ is deliberately NOT excluded: cmd/seed reads testdata/knowledge at
+# runtime, so it has to ship in the image.

@@ -34,11 +34,14 @@
 ## レイアウト
 
 ```
-docker-compose.yml     postgres+pgvector / MinIO
+docker-compose.yml     postgres+pgvector / MinIO / backend / frontend / seed
 frontend/               Vite + React + TypeScript
+  Dockerfile            node でビルド → Caddy で配信するマルチステージ
+  Caddyfile             SPA フォールバック + /api を backend へリバースプロキシ
   src/api/client.ts     ペルソナ/会話 API の型付きクライアント、SSE ストリーム
   src/App.tsx           チャット UI
 backend/
+  Dockerfile            server と seed の2バイナリを distroless に載せる
   cmd/server/           main: 依存の組み立て、HTTP サーバ、graceful shutdown
   cmd/seed/              dev 用フィクスチャ投入（MinIO + pgvector + サンプルペルソナ2体）
   internal/api/          ルーティング、ハンドラ、SSE、CORS
@@ -59,19 +62,42 @@ backend/
 
 ## はじめかた
 
+起動方法は2通りある。どちらも <http://localhost:5173> を開いて使う。**ホスト port 8080 を取り合うので併用はできない。**
+
+### A. 全部 Docker（Go / Node をホストに入れなくてよい）
+
+```sh
+cp .env.example .env
+# .env を開き OPENAI_API_KEY を設定する
+
+make docker-up    # postgres/MinIO/backend/frontend をビルドして起動
+make docker-seed  # サンプル文書3件とペルソナ2体（批評家/実務家）を投入（初回のみ）
+```
+
+frontend は Caddy が静的ファイルを配信し、`/api/*` を backend コンテナへリバースプロキシする。ブラウザからは同一オリジンにしか見えないので CORS は経由しない。
+
+```sh
+make docker-logs  # backend/frontend のログを追う
+make docker-down  # 停止
+```
+
+### B. ホストで開発（ホットリロード）
+
 ```sh
 cp .env.example .env
 # .env を開き OPENAI_API_KEY を設定する
 
 make setup   # npm install + go mod download
-make up      # docker compose up -d、依存が healthy になるまで待つ
-make seed    # サンプル文書3件とペルソナ2体（批評家/実務家）を投入
+make up      # postgres/MinIO だけを起動し、healthy になるまで待つ
+make seed    # サンプル文書3件とペルソナ2体を投入
 make dev     # Go API を :8080、Vite を :5173 で起動（up は自動実行される）
 ```
 
-<http://localhost:5173> を開く。ペルソナを選び、メッセージを送るとストリーミングで応答が返る。
+`make up` が postgres/MinIO しか起動しないのは意図的で、backend コンテナまで立ち上げると `make dev` のホスト側 Go プロセスと port 8080 が衝突するため。
 
 バックエンド/フロントエンドは `make dev-backend` / `make dev-frontend` で個別にも起動できる。
+
+> **Note**: B の経路では `.env` は自動で読み込まれない（Go 側に dotenv ローダを入れていない）。direnv を使うか `set -a; source .env; set +a` などで export すること。A の経路では compose の `env_file` が読み込む。
 
 ## API
 
@@ -92,12 +118,18 @@ make dev     # Go API を :8080、Vite を :5173 で起動（up は自動実行�
 ## その他のコマンド
 
 ```sh
-make test    # go test ./...（-race は手動で: cd backend && go test ./... -race）
-make lint    # oxlint + go vet
-make build   # frontend/dist + backend/bin/server
-make down    # docker compose を停止
-make logs    # docker compose のログを追う
-make clean   # ビルド成果物を削除
+make test          # go test ./...（-race は手動で: cd backend && go test ./... -race）
+make lint          # oxlint + go vet
+make build         # frontend/dist + backend/bin/server
+make down          # docker compose を停止
+make logs          # docker compose のログを追う
+make clean         # ビルド成果物を削除
+
+make docker-build  # backend/frontend のイメージをビルド
+make docker-up     # 全部コンテナで起動
+make docker-seed   # seeder イメージでフィクスチャ投入
+make docker-logs   # backend/frontend のログを追う
+make docker-down   # 全部停止
 ```
 
 ### 統合テスト
@@ -125,6 +157,7 @@ cd backend && go test ./internal/retrieval/... -run TestSearchAgainstPostgres -v
 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | `minioadmin` | backend, seed |
 | `MINIO_BUCKET` | `kaigi-knowledge` | backend, seed |
 | `MINIO_USE_SSL` | `false` | backend |
+| `MINIO_REGION` | `us-east-1` | backend, seed（presign 時のリージョン。未指定だとネットワーク越しの照会が走る） |
 | `OPENAI_API_KEY` | （必須、既定なし） | backend, seed（chat + embedding 共用）。未設定だと起動時に失敗する |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | backend, seed |
 | `CHAT_MODEL` | `gpt-5-mini` | backend |
@@ -137,7 +170,30 @@ cd backend && go test ./internal/retrieval/... -run TestSearchAgainstPostgres -v
 | `RELEVANCE_SKEPTICISM_SPAN` | `0.20` | backend（`Skepticism` に応じて閾値が上乗せされる幅） |
 | `VITE_API_PROXY_TARGET` | `http://localhost:8080` | frontend |
 
-開発時は Vite のプロキシによりブラウザからは単一オリジンにしか見えないため CORS は経由しない。`ALLOWED_ORIGINS` はフロントエンドを別ホストから配信する場合に効く。
+開発時は Vite のプロキシ、Docker 起動時は Caddy のリバースプロキシにより、いずれもブラウザからは単一オリジンにしか見えないため CORS は経由しない。`ALLOWED_ORIGINS` はフロントエンドを別ホストから配信する場合に効く。
+
+`make docker-up` で起動した場合、コンテナ内から見た接続先が変わるため以下は `docker-compose.yml` 側で上書きされる（`.env` の値より優先される）。
+
+| 変数 | コンテナでの値 | 理由 |
+| --- | --- | --- |
+| `DATABASE_URL` | `...@postgres:5432/...` | compose ネットワーク内のサービス名で解決する |
+| `MINIO_ENDPOINT` | `minio:9000` | backend → MinIO はサービス名で接続する |
+| `MINIO_PUBLIC_ENDPOINT` | `localhost:9000` | presigned URL を開くのはブラウザなので、公開ポートを指す必要がある |
+
+### 既存環境からの移行
+
+埋め込みモデルが変わったのでベクトルの次元も空間も変わる。マイグレーション `0002` が
+`chunks` と `persona_interests` を空にするので、再 seed が必要。
+
+```sh
+make down
+docker volume rm kaigi_hf-cache   # TEI のモデルキャッシュ(~2.5GB)を解放
+make up
+cd backend && go run ./cmd/server   # マイグレーション 0002 を適用
+make seed                            # 1536 次元で作り直す
+```
+
+既存の会話の本文は残るが、引用（`message_citations`）は `chunks` の削除に連動して消える。
 
 ## スコープ外
 

@@ -44,6 +44,9 @@ type ObjectStoreConfig struct {
 	SecretKey      string
 	Bucket         string
 	UseSSL         bool
+	// Region is supplied rather than discovered: see objectstore.New for why a
+	// lookup would dial the wrong host. MinIO's own default is us-east-1.
+	Region string
 }
 
 // LLMConfig targets OpenAI's chat completions API. BaseURL stays
@@ -96,6 +99,7 @@ func Load() Config {
 			SecretKey:      env("MINIO_SECRET_KEY", "minioadmin"),
 			Bucket:         env("MINIO_BUCKET", "kaigi-knowledge"),
 			UseSSL:         envBool("MINIO_USE_SSL", false),
+			Region:         env("MINIO_REGION", "us-east-1"),
 		},
 		Embed: EmbedConfig{
 			BaseURL: env("OPENAI_BASE_URL", "https://api.openai.com/v1"),

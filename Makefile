@@ -1,4 +1,6 @@
-.PHONY: help setup up down logs seed dev dev-backend dev-frontend build test lint clean
+.PHONY: help setup up down logs seed dev dev-backend dev-frontend \
+        docker-up docker-down docker-seed docker-logs docker-build \
+        build test lint clean
 
 help: ## Show available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -7,8 +9,11 @@ setup: ## Install all dependencies
 	cd frontend && npm install
 	cd backend && go mod download
 
-up: ## Start postgres/MinIO via docker compose and wait for them to be healthy
-	docker compose up -d
+up: ## Start postgres/MinIO only (the dependencies `make dev` needs) and wait for health
+	# Services are named explicitly rather than starting everything: a bare
+	# `docker compose up -d` would also start the backend container, which binds
+	# the same host port 8080 that `make dev` then tries to listen on.
+	docker compose up -d postgres minio minio-init
 	@echo "waiting for dependencies to become healthy..."
 	@until [ "$$(docker compose ps --format '{{.Health}}' postgres minio 2>/dev/null | grep -cv healthy)" = "0" ]; do sleep 5; done
 	@echo "all dependencies healthy"
@@ -19,8 +24,26 @@ down: ## Stop docker compose services
 logs: ## Follow docker compose logs
 	docker compose logs -f
 
-seed: ## Load sample documents and personas into the running stack
+seed: ## Load sample documents and personas into the running stack (host Go)
 	cd backend && go run ./cmd/seed
+
+docker-build: ## Build the backend and frontend images
+	docker compose build
+
+docker-up: ## Run the whole stack in containers (frontend on :5173, API on :8080)
+	docker compose up -d --build
+	@echo "waiting for dependencies to become healthy..."
+	@until [ "$$(docker compose ps --format '{{.Health}}' postgres minio 2>/dev/null | grep -cv healthy)" = "0" ]; do sleep 5; done
+	@echo "stack up — open http://localhost:5173 (run 'make docker-seed' on first start)"
+
+docker-seed: ## Load the sample fixtures using the seeder image
+	docker compose run --rm seed
+
+docker-logs: ## Follow backend and frontend container logs
+	docker compose logs -f backend frontend
+
+docker-down: ## Stop the whole containerised stack
+	docker compose down
 
 dev: up ## Run backend and frontend together (Ctrl-C stops both); starts docker compose first
 	@trap 'kill 0' EXIT INT TERM; \

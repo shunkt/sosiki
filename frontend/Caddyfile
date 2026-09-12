@@ -1,0 +1,24 @@
+# Plain :80 — no hostname, so Caddy serves HTTP only and never tries to
+# provision a certificate. TLS termination is somebody else's job here.
+:80 {
+	# The path is passed through unchanged: the Go router registers /api/health,
+	# /api/personas and friends, so stripping the prefix would 404 everything.
+	#
+	# No buffering directives are needed. Caddy's reverse_proxy streams responses
+	# straight through, which is what keeps the SSE endpoint
+	# (POST /api/conversations/{id}/messages) delivering tokens as they arrive
+	# instead of releasing them in one lump at the end.
+	handle /api/* {
+		reverse_proxy backend:8080
+	}
+
+	# Everything else is the SPA. encode lives in this block rather than at the
+	# site level on purpose: compressing the API responses would put a buffering
+	# layer back in front of the SSE stream, undoing the point above.
+	handle {
+		root * /usr/share/caddy
+		encode gzip
+		try_files {path} /index.html
+		file_server
+	}
+}

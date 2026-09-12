@@ -1,8 +1,35 @@
 name: kaigi
 
-# Development dependencies only. Nothing here is production-shaped: credentials
-# are the well-known defaults and every port is published to the host so the Go
-# backend can run outside compose during development.
+# Nothing here is production-shaped: credentials are the well-known defaults and
+# every port is published to the host.
+#
+# Two ways to run this stack:
+#   make up        -> postgres/minio only; the Go and Vite processes run on the
+#                     host via `make dev`, which is the hot-reload loop.
+#   make docker-up -> everything in containers, including backend and frontend.
+# The two are mutually exclusive: both want host port 8080.
+
+# Shared by the API server and the one-shot seeder — same database, same bucket,
+# same API key.
+x-backend-env: &backend-env
+  DATABASE_URL: postgres://postgres:kaigi@postgres:5432/kaigi?sslmode=disable
+  # Inside the compose network MinIO answers to its service name, but presigned
+  # URLs are opened by the browser, which can only resolve the published host
+  # port. Splitting the two is exactly what these config fields exist for.
+  MINIO_ENDPOINT: minio:9000
+  MINIO_PUBLIC_ENDPOINT: localhost:9000
+  ALLOWED_ORIGINS: http://localhost:5173
+
+# minio-init has to have finished, not merely started: it is what creates the
+# bucket both services then write to and presign against.
+x-backend-depends: &backend-depends
+  postgres:
+    condition: service_healthy
+  minio:
+    condition: service_healthy
+  minio-init:
+    condition: service_completed_successfully
+
 services:
   postgres:
     image: pgvector/pgvector:pg17
@@ -50,6 +77,43 @@ services:
         mc alias set local http://minio:9000 minioadmin minioadmin &&
         mc mb --ignore-existing local/kaigi-knowledge &&
         echo "bucket kaigi-knowledge ready"
+    restart: "no"
+
+  backend:
+    build: ./backend
+    # required:false keeps `make up` working on a fresh clone that has not run
+    # `cp .env.example .env` yet. A missing OPENAI_API_KEY still fails loudly,
+    # but at boot with a named error rather than here with a file-not-found.
+    env_file:
+      - path: .env
+        required: false
+    environment: *backend-env
+    depends_on: *backend-depends
+    ports:
+      - "8080:8080"
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    # Published on 5173 to match the Vite port the README and ALLOWED_ORIGINS
+    # already use, so the URL is the same whichever way the stack is started.
+    ports:
+      - "5173:80"
+
+  # Not started by `docker compose up` — it is behind a profile and meant to be
+  # run on demand: `docker compose run --rm seed` (or `make docker-seed`).
+  seed:
+    build: ./backend
+    # entrypoint, not command: the image's ENTRYPOINT is the server binary, and
+    # `command` would be appended to it as an argument rather than replacing it.
+    entrypoint: ["/app/seed"]
+    profiles: ["seed"]
+    env_file:
+      - path: .env
+        required: false
+    environment: *backend-env
+    depends_on: *backend-depends
     restart: "no"
 
 volumes:

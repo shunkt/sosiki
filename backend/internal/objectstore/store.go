@@ -29,14 +29,25 @@ type Store struct {
 func New(cfg config.ObjectStoreConfig) (*Store, error) {
 	creds := credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, "")
 
-	client, err := minio.New(cfg.Endpoint, &minio.Options{Creds: creds, Secure: cfg.UseSSL})
+	// Region must be set explicitly. Without it minio-go resolves the bucket's
+	// location on first use by calling GET /{bucket}/?location= against the
+	// client's own endpoint — and the presign client's endpoint is the browser-
+	// facing one, which the backend itself generally cannot reach (inside
+	// compose, "localhost:9000" is the backend container's own loopback).
+	// Signing needs the region, not a live lookup, so supplying it keeps
+	// PresignedGetObject a pure local computation.
+	opts := func() *minio.Options {
+		return &minio.Options{Creds: creds, Secure: cfg.UseSSL, Region: cfg.Region}
+	}
+
+	client, err := minio.New(cfg.Endpoint, opts())
 	if err != nil {
 		return nil, fmt.Errorf("objectstore: new client: %w", err)
 	}
 
 	presignClient := client
 	if cfg.PublicEndpoint != cfg.Endpoint {
-		presignClient, err = minio.New(cfg.PublicEndpoint, &minio.Options{Creds: creds, Secure: cfg.UseSSL})
+		presignClient, err = minio.New(cfg.PublicEndpoint, opts())
 		if err != nil {
 			return nil, fmt.Errorf("objectstore: new presign client: %w", err)
 		}
