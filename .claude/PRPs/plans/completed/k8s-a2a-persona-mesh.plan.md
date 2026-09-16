@@ -1,5 +1,7 @@
 # Plan: Kubernetes 上の A2A ペルソナ会議
 
+> **実装ステータス（2026-09-17）**: Task 1-21（Go バックエンドのコア + Docker Compose 化）完了・コミット済み（`fc55708`）。**Task 22-26（k8s マニフェスト、kind クラスタ、フロントエンド会議UI、Makefile/README更新）は未着手。** 詳細は `.claude/PRPs/reports/k8s-a2a-persona-mesh-report.md` を参照。このファイルは参照用に `completed/` へ移動したが、後続タスクを実装する際は Task 22 以降をこのまま実行できる。
+
 ## Summary
 
 単一プロセスの kaigi バックエンドを、Kubernetes 上の4種類の pod に解体する。ペルソナは1体1 pod の独立した **A2A エージェント**になり、フロントエンド pod が司会としてラウンドを回し、各ペルソナ pod へ A2A の `SendStreamingMessage` を発行する。ペルソナは前の発言者の発言を会議録として受け取るので、同じ知識ベースを見ながら互いの主張に反応する。Postgres は1インスタンスのまま、機能ごとに**データベースを切り替える**（`kaigi_meeting` / `kaigi_registry` / `kaigi_persona` / `kaigi_knowledge`）。
