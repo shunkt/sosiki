@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/shun/kaigi/backend/internal/chat"
+	"github.com/shun/kaigi/backend/internal/meeting"
 )
 
 // keepAliveInterval bounds how long an idle SSE connection can go without a
@@ -16,23 +16,28 @@ import (
 // dead and close it.
 const keepAliveInterval = 15 * time.Second
 
-// frameWriteTimeout bounds a single SSE frame write. main.go leaves
-// WriteTimeout unset on the server (it would cut the whole stream off), so
-// each frame gets its own deadline here instead.
+// frameWriteTimeout bounds a single SSE frame write. The server leaves
+// WriteTimeout unset (it would cut the whole stream off), so each frame
+// gets its own deadline here instead.
 const frameWriteTimeout = 30 * time.Second
 
-type sendMessageRequest struct {
+type sendTurnRequest struct {
 	Content string `json:"content"`
+	Rounds  int    `json:"rounds"`
 }
 
-func (h *handlers) handleSendMessage(w http.ResponseWriter, r *http.Request) {
+// handleSendTurn streams a meeting turn as SSE: a moderator.Moderator.Run
+// call fans one utterance out into speaker_start/sources/token*/speaker_end
+// events per participant per round — see meeting.Event and the plan's UX
+// Design for the full frame sequence.
+func (h *handlers) handleSendTurn(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid conversation id"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid meeting id"})
 		return
 	}
 
-	var req sendMessageRequest
+	var req sendTurnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
@@ -40,6 +45,10 @@ func (h *handlers) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	if req.Content == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content must not be empty"})
 		return
+	}
+	rounds := req.Rounds
+	if rounds <= 0 {
+		rounds = h.deps.DefaultRounds
 	}
 
 	// All headers must be set before the first WriteHeader/Write — once the
@@ -57,12 +66,12 @@ func (h *handlers) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		h.deps.Log.Error("SSE flush unsupported; response will buffer until handler returns", "error", err)
 	}
 
-	events := make(chan chat.Event, 16)
+	events := make(chan meeting.Event, 16)
 	go func() {
 		defer close(events)
-		if err := h.deps.Chat.Reply(r.Context(), id, req.Content, events); err != nil {
-			h.deps.Log.Error("chat reply failed", "conversation_id", id, "error", err)
-			events <- chat.Event{Type: "error", Error: err.Error()}
+		if err := h.deps.Moderator.Run(r.Context(), id, req.Content, rounds, events); err != nil {
+			h.deps.Log.Error("meeting turn failed", "meeting_id", id, "error", err)
+			events <- meeting.Event{Type: "error", Error: err.Error()}
 		}
 	}()
 
@@ -77,7 +86,7 @@ func (h *handlers) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = rc.SetWriteDeadline(time.Now().Add(frameWriteTimeout))
 			if err := writeSSE(w, ev); err != nil {
-				h.deps.Log.Error("SSE write failed", "conversation_id", id, "error", err)
+				h.deps.Log.Error("SSE write failed", "meeting_id", id, "error", err)
 				return
 			}
 			_ = rc.Flush()
@@ -98,7 +107,7 @@ func (h *handlers) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 // writeSSE encodes ev as JSON in the data field. The value must be
 // JSON-encoded, not interpolated as raw text: a token containing a newline
 // would otherwise start a new SSE field and corrupt the frame.
-func writeSSE(w http.ResponseWriter, ev chat.Event) error {
+func writeSSE(w http.ResponseWriter, ev meeting.Event) error {
 	body, err := json.Marshal(ev)
 	if err != nil {
 		return fmt.Errorf("marshal event: %w", err)

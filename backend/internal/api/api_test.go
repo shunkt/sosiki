@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,9 +14,12 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/shun/kaigi/backend/internal/chat"
 	"github.com/shun/kaigi/backend/internal/config"
+	"github.com/shun/kaigi/backend/internal/meeting"
+	"github.com/shun/kaigi/backend/internal/registry"
 )
+
+var errFakeModerator = errors.New("fake moderator failure")
 
 func testConfig() config.Config {
 	return config.Config{
@@ -24,12 +28,22 @@ func testConfig() config.Config {
 	}
 }
 
+type fakeAgentLister struct {
+	agents []registry.AgentDTO
+	err    error
+}
+
+func (f fakeAgentLister) ListAgents(context.Context) ([]registry.AgentDTO, error) {
+	return f.agents, f.err
+}
+
 // newTestHandler wires no Pool, so handleHealth reports db as
 // "unconfigured" and the overall status as "degraded". A live probe is
 // exercised manually against the docker-compose stack.
 func newTestHandler() http.Handler {
 	return NewHandler(testConfig(), Deps{
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Agents: fakeAgentLister{},
 	})
 }
 
@@ -44,9 +58,6 @@ func TestHealth(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	// No Pool wired (see newTestHandler) makes "degraded" the correct answer
-	// here — a live check is exercised manually against the docker-compose
-	// stack per the plan's Task 1 VALIDATE.
 	if body["status"] != "degraded" {
 		t.Errorf("status field = %q, want %q", body["status"], "degraded")
 	}
@@ -78,8 +89,6 @@ func TestCORSOnlyEchoesAllowedOrigin(t *testing.T) {
 func TestStatusRecorderSupportsFlush(t *testing.T) {
 	rec := &statusRecorder{ResponseWriter: httptest.NewRecorder(), status: http.StatusOK}
 
-	// Without Unwrap the controller cannot find the Flusher and SSE silently
-	// buffers every token until the handler returns.
 	if err := http.NewResponseController(rec).Flush(); err != nil {
 		t.Fatalf("Flush through statusRecorder: %v", err)
 	}
@@ -96,39 +105,109 @@ func TestPreflightReturnsNoContent(t *testing.T) {
 	}
 }
 
-// --- SSE handler tests (Task 11) ---
+func TestListPersonas(t *testing.T) {
+	h := NewHandler(testConfig(), Deps{
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Agents: fakeAgentLister{agents: []registry.AgentDTO{
+			{Slug: "critic", Name: "批評家", Present: true},
+		}},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/personas", nil))
 
-// fakeChatEngine drives handleSendMessage's frame-by-frame behavior without
-// a live OpenAI/Postgres/MinIO stack.
-type fakeChatEngine struct {
-	events []chat.Event
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var agents []registry.AgentDTO
+	if err := json.NewDecoder(rec.Body).Decode(&agents); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(agents) != 1 || agents[0].Slug != "critic" {
+		t.Errorf("agents = %+v, want 1 entry with slug critic", agents)
+	}
+}
+
+func TestCreateMeetingRejectsAbsentPersona(t *testing.T) {
+	h := NewHandler(testConfig(), Deps{
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Agents: fakeAgentLister{agents: []registry.AgentDTO{
+			{Slug: "critic", Name: "批評家", Present: false},
+		}},
+	})
+
+	body := strings.NewReader(`{"topic":"x","personaSlugs":["critic"]}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/meetings", body)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestCreateMeetingRejectsUnknownPersona(t *testing.T) {
+	h := NewHandler(testConfig(), Deps{
+		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Agents: fakeAgentLister{agents: nil},
+	})
+
+	body := strings.NewReader(`{"topic":"x","personaSlugs":["ghost"]}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/meetings", body)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestCreateMeetingRejectsEmptyParticipants(t *testing.T) {
+	h := newTestHandler()
+	body := strings.NewReader(`{"topic":"x","personaSlugs":[]}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/meetings", body)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+// --- SSE handler tests ---
+
+// fakeModerator drives handleSendTurn's frame-by-frame behavior without
+// live persona pods.
+type fakeModerator struct {
+	events []meeting.Event
 	err    error
 }
 
-func (f fakeChatEngine) Reply(_ context.Context, _ uuid.UUID, _ string, out chan<- chat.Event) error {
+func (f fakeModerator) Run(_ context.Context, _ uuid.UUID, _ string, _ int, out chan<- meeting.Event) error {
 	for _, ev := range f.events {
 		out <- ev
 	}
 	return f.err
 }
 
-func newSSETestHandler(engine fakeChatEngine) http.Handler {
+func newSSETestHandler(mod fakeModerator) http.Handler {
 	return NewHandler(testConfig(), Deps{
-		Log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Chat: engine,
+		Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Agents:        fakeAgentLister{},
+		Moderator:     mod,
+		DefaultRounds: 1,
 	})
 }
 
-func TestSSEFramesAreSeparate(t *testing.T) {
-	engine := fakeChatEngine{events: []chat.Event{
-		{Type: "token", Text: "a"},
-		{Type: "token", Text: "b"},
-		{Type: "token", Text: "c"},
+func TestSendTurnFramesAreSeparate(t *testing.T) {
+	mod := fakeModerator{events: []meeting.Event{
+		{Type: "token", PersonaSlug: "critic", Text: "a"},
+		{Type: "token", PersonaSlug: "critic", Text: "b"},
+		{Type: "token", PersonaSlug: "critic", Text: "c"},
 	}}
-	srv := httptest.NewServer(newSSETestHandler(engine))
+	srv := httptest.NewServer(newSSETestHandler(mod))
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Post(srv.URL+"/api/conversations/"+uuid.NewString()+"/messages",
+	resp, err := http.Post(srv.URL+"/api/meetings/"+uuid.NewString()+"/turns",
 		"application/json", strings.NewReader(`{"content":"hi"}`))
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -138,27 +217,23 @@ func TestSSEFramesAreSeparate(t *testing.T) {
 	var tokenFrames int
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "event: token") {
+		if strings.HasPrefix(scanner.Text(), "event: token") {
 			tokenFrames++
 		}
 	}
-	// If Flush weren't reaching the client (the statusRecorder.Unwrap bug
-	// this whole feature guards against), all three tokens would arrive as
-	// one frame instead of three.
 	if tokenFrames != 3 {
 		t.Errorf("got %d separate token frames, want 3", tokenFrames)
 	}
 }
 
-func TestSSEEncodesNewlinesInTokens(t *testing.T) {
-	engine := fakeChatEngine{events: []chat.Event{
-		{Type: "token", Text: "line one\nline two"},
+func TestSendTurnEncodesNewlinesInTokens(t *testing.T) {
+	mod := fakeModerator{events: []meeting.Event{
+		{Type: "token", PersonaSlug: "critic", Text: "line one\nline two"},
 	}}
-	srv := httptest.NewServer(newSSETestHandler(engine))
+	srv := httptest.NewServer(newSSETestHandler(mod))
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Post(srv.URL+"/api/conversations/"+uuid.NewString()+"/messages",
+	resp, err := http.Post(srv.URL+"/api/meetings/"+uuid.NewString()+"/turns",
 		"application/json", strings.NewReader(`{"content":"hi"}`))
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -170,7 +245,7 @@ func TestSSEEncodesNewlinesInTokens(t *testing.T) {
 	for scanner.Scan() {
 		if strings.HasPrefix(scanner.Text(), "data: ") {
 			dataLines++
-			var ev chat.Event
+			var ev meeting.Event
 			if err := json.Unmarshal([]byte(strings.TrimPrefix(scanner.Text(), "data: ")), &ev); err != nil {
 				t.Fatalf("data line is not valid JSON (a raw newline in the token corrupted the frame): %v", err)
 			}
@@ -181,11 +256,11 @@ func TestSSEEncodesNewlinesInTokens(t *testing.T) {
 	}
 }
 
-func TestSendMessageRejectsEmptyContent(t *testing.T) {
-	srv := httptest.NewServer(newSSETestHandler(fakeChatEngine{}))
+func TestSendTurnRejectsEmptyContent(t *testing.T) {
+	srv := httptest.NewServer(newSSETestHandler(fakeModerator{}))
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Post(srv.URL+"/api/conversations/"+uuid.NewString()+"/messages",
+	resp, err := http.Post(srv.URL+"/api/meetings/"+uuid.NewString()+"/turns",
 		"application/json", strings.NewReader(`{"content":""}`))
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -197,11 +272,11 @@ func TestSendMessageRejectsEmptyContent(t *testing.T) {
 	}
 }
 
-func TestSendMessageRejectsInvalidConversationID(t *testing.T) {
-	srv := httptest.NewServer(newSSETestHandler(fakeChatEngine{}))
+func TestSendTurnRejectsInvalidMeetingID(t *testing.T) {
+	srv := httptest.NewServer(newSSETestHandler(fakeModerator{}))
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Post(srv.URL+"/api/conversations/not-a-uuid/messages",
+	resp, err := http.Post(srv.URL+"/api/meetings/not-a-uuid/turns",
 		"application/json", strings.NewReader(`{"content":"hi"}`))
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -213,26 +288,26 @@ func TestSendMessageRejectsInvalidConversationID(t *testing.T) {
 	}
 }
 
-func TestSSEEmitsErrorEventOnEngineFailure(t *testing.T) {
-	engine := fakeChatEngine{err: io.ErrUnexpectedEOF}
-	srv := httptest.NewServer(newSSETestHandler(engine))
+func TestSendTurnEmitsErrorEventOnModeratorFailure(t *testing.T) {
+	mod := fakeModerator{err: errFakeModerator}
+	srv := httptest.NewServer(newSSETestHandler(mod))
 	t.Cleanup(srv.Close)
 
-	resp, err := http.Post(srv.URL+"/api/conversations/"+uuid.NewString()+"/messages",
+	resp, err := http.Post(srv.URL+"/api/meetings/"+uuid.NewString()+"/turns",
 		"application/json", strings.NewReader(`{"content":"hi"}`))
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
 	defer resp.Body.Close()
 
-	var gotError bool
+	var gotErrorFrame bool
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		if strings.HasPrefix(scanner.Text(), "event: error") {
-			gotError = true
+			gotErrorFrame = true
 		}
 	}
-	if !gotError {
-		t.Error("expected an error event when the engine returns an error")
+	if !gotErrorFrame {
+		t.Error("expected an error frame when the moderator returns an error")
 	}
 }

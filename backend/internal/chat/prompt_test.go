@@ -25,21 +25,53 @@ func testPersona() persona.Persona {
 }
 
 // TestBuildSystemPromptIsStable guards the OpenAI automatic-caching
-// contract: the same persona must render to byte-identical prompts across
-// calls, since nothing marks a cache boundary explicitly — a stable prefix
-// is the only lever.
+// contract: the same persona+participants must render to byte-identical
+// prompts across calls, since nothing marks a cache boundary explicitly — a
+// stable prefix is the only lever.
 func TestBuildSystemPromptIsStable(t *testing.T) {
 	p := testPersona()
-	a := BuildSystemPrompt(p)
-	b := BuildSystemPrompt(p)
+	a := BuildSystemPrompt(p, []string{"批評家", "実務家"})
+	b := BuildSystemPrompt(p, []string{"批評家", "実務家"})
 	if a != b {
 		t.Errorf("BuildSystemPrompt is not stable across calls:\n%q\nvs\n%q", a, b)
 	}
 }
 
+// TestBuildSystemPromptStableAcrossParticipantOrder is the meeting-specific
+// half of the caching contract: participant order comes from
+// speaking_order, which is not guaranteed to be sorted, so two calls with
+// the same set of participants in different orders must still cache-hit.
+func TestBuildSystemPromptStableAcrossParticipantOrder(t *testing.T) {
+	p := testPersona()
+	a := BuildSystemPrompt(p, []string{"批評家", "実務家", "設計者"})
+	b := BuildSystemPrompt(p, []string{"設計者", "批評家", "実務家"})
+	if a != b {
+		t.Errorf("BuildSystemPrompt varies with participant order:\n%q\nvs\n%q", a, b)
+	}
+}
+
+func TestBuildSystemPromptSingleParticipant(t *testing.T) {
+	p := testPersona()
+	got := BuildSystemPrompt(p, []string{"批評家"})
+	if strings.Contains(got, "複数人の会議です") {
+		t.Errorf("prompt mentions a meeting with a single participant:\n%s", got)
+	}
+}
+
+func TestBuildSystemPromptMentionsOtherParticipants(t *testing.T) {
+	p := testPersona()
+	got := BuildSystemPrompt(p, []string{"批評家", "実務家"})
+	if !strings.Contains(got, "実務家") {
+		t.Errorf("prompt does not mention the other participant:\n%s", got)
+	}
+	if strings.Contains(got, "他の参加者: 批評家") {
+		t.Errorf("prompt lists the persona itself as an other participant:\n%s", got)
+	}
+}
+
 func TestBuildSystemPromptReflectsPersonality(t *testing.T) {
 	p := testPersona()
-	got := BuildSystemPrompt(p)
+	got := BuildSystemPrompt(p, nil)
 
 	for _, want := range []string{"批評家", "形式的検証", "マーケティング", "留保"} {
 		if !strings.Contains(got, want) {

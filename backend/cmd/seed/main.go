@@ -1,8 +1,13 @@
-// Command seed loads backend/testdata/knowledge/*.md into MinIO and pgvector,
-// and creates two sample personas with contrasting personalities so the
-// persona-weighted rerank has something visible to demonstrate. It is
-// idempotent: re-running it does not duplicate documents, chunks, or
-// personas.
+// Command seed loads backend/testdata/knowledge/*.md into MinIO and
+// kaigi_knowledge, and creates two sample personas with contrasting
+// personalities into kaigi_persona so the persona-weighted rerank has
+// something visible to demonstrate. It is idempotent: re-running it does
+// not duplicate documents, chunks, or personas.
+//
+// Persona slugs seeded here ("critic", "pragmatist") are a contract with the
+// persona pod manifests: each cmd/persona process is configured with
+// PERSONA_SLUG and refuses to start if no row with that slug exists — see
+// persona.Store.GetBySlug.
 package main
 
 import (
@@ -14,8 +19,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -44,13 +47,28 @@ func main() {
 }
 
 func run(ctx context.Context, log *slog.Logger) error {
-	cfg := config.Load()
-
-	pool, err := db.New(ctx, cfg.DatabaseURL, log)
+	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
+	// seed calls OpenAI directly (embeddings) and creates personas whose
+	// downstream persona pods need OPENAI_API_KEY too, so this is a boot
+	// error here just as it is for cmd/persona.
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	knowledgePool, err := db.New(ctx, cfg.Databases.Knowledge, "knowledge", log)
+	if err != nil {
+		return err
+	}
+	defer knowledgePool.Close()
+
+	personaPool, err := db.New(ctx, cfg.Databases.Persona, "persona", log)
+	if err != nil {
+		return err
+	}
+	defer personaPool.Close()
 
 	minioClient, err := minio.New(cfg.ObjectStore.Endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.ObjectStore.AccessKey, cfg.ObjectStore.SecretKey, ""),
@@ -61,12 +79,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 
 	embedder := retrieval.NewEmbedder(cfg.Embed)
-	personas := persona.NewStore(pool, embedder)
+	personas := persona.NewStore(personaPool, embedder)
 
-	if err := seedDocuments(ctx, log, pool, minioClient, embedder, cfg.ObjectStore.Bucket); err != nil {
+	if err := seedDocuments(ctx, log, knowledgePool, minioClient, embedder, cfg.ObjectStore.Bucket); err != nil {
 		return err
 	}
-	if err := seedPersonas(ctx, log, pool, personas); err != nil {
+	if err := seedPersonas(ctx, log, personaPool, personas); err != nil {
 		return err
 	}
 
@@ -189,6 +207,7 @@ func chunkText(s string) []chunk {
 func seedPersonas(ctx context.Context, log *slog.Logger, pool *pgxpool.Pool, personas *persona.Store) error {
 	specs := []persona.CreateInput{
 		{
+			Slug:       "critic",
 			Name:       "批評家",
 			Stance:     "主張は額面通り受け取らず、根拠の強さと反証可能性を重視する",
 			Verbosity:  persona.VerbosityDetailed,
@@ -199,6 +218,7 @@ func seedPersonas(ctx context.Context, log *slog.Logger, pool *pgxpool.Pool, per
 			},
 		},
 		{
+			Slug:       "pragmatist",
 			Name:       "実務家",
 			Stance:     "理論的な優劣よりも、運用現場でどれだけ手間が減るかを重視する",
 			Verbosity:  persona.VerbosityConcise,
@@ -211,34 +231,17 @@ func seedPersonas(ctx context.Context, log *slog.Logger, pool *pgxpool.Pool, per
 	}
 
 	for _, spec := range specs {
-		var id uuid.UUID
-		var interestCount int
-		err := pool.QueryRow(ctx, `
-			SELECT p.id, count(i.id)
-			FROM personas p
-			LEFT JOIN persona_interests i ON i.persona_id = p.id
-			WHERE p.name = $1
-			GROUP BY p.id
-		`, spec.Name).Scan(&id, &interestCount)
+		_, err := personas.GetBySlug(ctx, spec.Slug)
 		switch {
-		case errors.Is(err, pgx.ErrNoRows):
+		case errors.Is(err, persona.ErrNotFound):
 			if _, err := personas.Create(ctx, spec); err != nil {
-				return fmt.Errorf("create persona %s: %w", spec.Name, err)
+				return fmt.Errorf("create persona %s: %w", spec.Slug, err)
 			}
-			log.Info("seeded persona", "name", spec.Name)
+			log.Info("seeded persona", "slug", spec.Slug, "name", spec.Name)
 		case err != nil:
-			return fmt.Errorf("check persona %s: %w", spec.Name, err)
-		case interestCount == len(spec.Interests):
-			log.Info("persona already seeded, skipping", "name", spec.Name)
+			return fmt.Errorf("check persona %s: %w", spec.Slug, err)
 		default:
-			// Interests went missing (migration 0002 empties them when the
-			// embedding width changes). Re-embed rather than skip: a persona
-			// with no interests scores every chunk identically.
-			if err := personas.ReplaceInterests(ctx, id, spec.Interests); err != nil {
-				return fmt.Errorf("replace interests for %s: %w", spec.Name, err)
-			}
-			log.Info("re-embedded persona interests", "name", spec.Name,
-				"had", interestCount, "want", len(spec.Interests))
+			log.Info("persona already seeded, skipping", "slug", spec.Slug)
 		}
 	}
 	return nil

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/shun/kaigi/backend/internal/persona"
@@ -13,9 +14,12 @@ import (
 // BuildSystemPrompt renders the persona's personality into the stable prefix
 // of every request in a conversation. OpenAI caches automatically on a
 // matching prefix — there is no explicit cache_control — so this string must
-// be byte-identical across turns for the same persona: no timestamps, no
-// conversation ID, nothing that varies.
-func BuildSystemPrompt(p persona.Persona) string {
+// be byte-identical across turns for the same persona+participants: no
+// timestamps, no meeting ID, nothing that varies. participants is every
+// speaking persona's Name in the meeting (order-independent — see othersOf,
+// which sorts before rendering, so two calls with the same set in different
+// orders still cache-hit).
+func BuildSystemPrompt(p persona.Persona, participants []string) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "あなたは「%s」というペルソナとして会話します。", p.Name)
@@ -42,6 +46,14 @@ func BuildSystemPrompt(p persona.Persona) string {
 
 	if p.Personality.Skepticism >= 0.7 {
 		b.WriteString("\n根拠が薄い主張には明示的に留保を付けてください。")
+	}
+
+	if others := othersOf(participants, p.Name); len(others) > 0 {
+		fmt.Fprintf(&b, "\nこれは複数人の会議です。他の参加者: %s。"+
+			"他の参加者の発言には【名前】が付いています。"+
+			"直前の発言に同意・反論する場合は誰のどの点に対してかを明示してください。"+
+			"他の参加者の発言を代弁したり、自分の発言として繰り返さないでください。",
+			strings.Join(others, "、"))
 	}
 
 	switch p.Personality.Verbosity {
@@ -139,4 +151,24 @@ func buildRewritePrompt(p persona.Persona, history []Message) string {
 		"「それ」「これ」などの指示語は直前の会話から具体的な語に置き換えてください。")
 	b.WriteString(`必ず次のJSON形式のみで出力してください: {"queries": ["クエリ1", "クエリ2"]}`)
 	return b.String()
+}
+
+// othersOf returns participants minus selfName, sorted. Sorting is what
+// keeps BuildSystemPrompt byte-identical regardless of the order the caller
+// happened to list participants in — participant order comes from
+// meeting_participants.speaking_order, which has no reason to be
+// alphabetical, but the system prompt must not vary with it (see
+// BuildSystemPrompt's cache-stability contract).
+func othersOf(participants []string, selfName string) []string {
+	if len(participants) == 0 {
+		return nil
+	}
+	others := make([]string, 0, len(participants))
+	for _, name := range participants {
+		if name != selfName {
+			others = append(others, name)
+		}
+	}
+	slices.Sort(others)
+	return others
 }

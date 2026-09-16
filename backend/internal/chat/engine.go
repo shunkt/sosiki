@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/shun/kaigi/backend/internal/config"
@@ -18,17 +17,20 @@ import (
 	"github.com/shun/kaigi/backend/internal/retrieval"
 )
 
-// The interfaces below are narrow seams over Store, retrieval.Searcher, and
-// objectstore.Store — the same pattern retrieval.Searcher uses for its own
-// embeddings client — so Reply's event ordering (sources -> token* -> done)
-// can be unit tested with fakes and no live Postgres or MinIO.
-type conversationStore interface {
-	PersonaFor(ctx context.Context, conversationID uuid.UUID) (persona.Persona, error)
-	History(ctx context.Context, conversationID uuid.UUID, limit int) ([]Message, error)
-	AppendMessage(ctx context.Context, conversationID uuid.UUID, role, content string) (Message, error)
-	SaveCitations(ctx context.Context, messageID uuid.UUID, candidates []retrieval.Candidate) error
+// Turn is one prior statement in the meeting, as seen by a persona. It is
+// passed in rather than loaded: a persona pod holds no conversation state
+// (see the plan's "なぜペルソナ pod を会話ステートレスにするのか"), so the
+// caller's transcript is the only history that exists for this Reply call.
+type Turn struct {
+	SpeakerName string // "user" for the human, the persona's own Name otherwise
+	Role        string // "user" | "persona"
+	Content     string
 }
 
+// The interfaces below are narrow seams over retrieval.Searcher and
+// objectstore.Store — the same pattern retrieval.Searcher uses for its own
+// embeddings client — so Reply's event ordering (sources -> token* -> done)
+// can be unit tested with fakes and no live OpenAI, Postgres, or MinIO.
 type knowledgeSearcher interface {
 	Search(ctx context.Context, p persona.Persona, queries []string) ([]retrieval.Candidate, error)
 }
@@ -38,13 +40,21 @@ type contextExpander interface {
 	PresignedURL(ctx context.Context, key string, ttl time.Duration) (string, error)
 }
 
-// Event is one unit of progress the HTTP layer turns into an SSE frame.
+// Event is one unit of progress the caller turns into an SSE frame (directly,
+// for a single-persona conversation, or wrapped into a meeting.Event by
+// personaexec/moderator). Persistence is the caller's job — unlike the
+// pre-A2A engine, Reply does not save anything itself: a persona pod has no
+// conversation database to save to (see the plan's DB-per-function split).
 type Event struct {
 	Type    string   `json:"type"` // "token" | "sources" | "done" | "error"
 	Text    string   `json:"text,omitempty"`
 	Sources []Source `json:"sources,omitempty"`
-	Message *Message `json:"message,omitempty"`
-	Error   string   `json:"error,omitempty"`
+	// Candidates carries the full retrieval.Candidate (chunk id, scores, MinIO
+	// location) on "done" so the caller can persist citations however its own
+	// storage layer wants — Source above is presign-resolved for a client,
+	// Candidates is the raw material for that.
+	Candidates []retrieval.Candidate `json:"-"`
+	Error      string                `json:"error,omitempty"`
 }
 
 // presignedURLTTL is how long a citation link handed to the frontend stays
@@ -56,49 +66,29 @@ type Engine struct {
 	llm      LLMClient
 	searcher knowledgeSearcher
 	objects  contextExpander
-	store    conversationStore
 	cfg      config.Config
 
-	// historyTurns bounds how much prior conversation is loaded and sent to
-	// the model each turn. Compaction is out of scope for this feature; a
-	// fixed cutoff is the simple stand-in — see the plan's Notes.
-	historyTurns int
 	// contextConcurrency bounds parallel MinIO reads when expanding chunks.
 	contextConcurrency int
 }
 
-func NewEngine(llm LLMClient, s *retrieval.Searcher, objects *objectstore.Store, store *Store, cfg config.Config) *Engine {
+func NewEngine(llm LLMClient, s *retrieval.Searcher, objects *objectstore.Store, cfg config.Config) *Engine {
 	return &Engine{
 		llm:                llm,
 		searcher:           s,
 		objects:            objects,
-		store:              store,
 		cfg:                cfg,
-		historyTurns:       20,
 		contextConcurrency: 4,
 	}
 }
 
-// Reply runs one turn and pushes events to out, closing it when done. It
-// owns the whole turn: it persists both the user message and the assistant
-// reply itself, so a client that disconnects mid-stream does not lose the
-// conversation.
-func (e *Engine) Reply(ctx context.Context, conversationID uuid.UUID, utterance string, out chan<- Event) error {
-	p, err := e.store.PersonaFor(ctx, conversationID)
-	if err != nil {
-		return fmt.Errorf("reply: load persona: %w", err)
-	}
-
-	history, err := e.store.History(ctx, conversationID, e.historyTurns)
-	if err != nil {
-		return fmt.Errorf("reply: load history: %w", err)
-	}
-
-	// Saved before generation starts: if the stream fails or the client
-	// disconnects, the user's message is not lost.
-	if _, err := e.store.AppendMessage(ctx, conversationID, "user", utterance); err != nil {
-		return fmt.Errorf("reply: save user message: %w", err)
-	}
+// Reply runs one turn for persona p against the transcript so far and pushes
+// events to out. It does not close out (the caller owns that, since the
+// caller may be multiplexing several personas onto one SSE stream — see
+// meeting.Moderator) and it does not persist anything: the caller decides
+// where the resulting message and citations live.
+func (e *Engine) Reply(ctx context.Context, p persona.Persona, participants []string, transcript []Turn, utterance string, out chan<- Event) error {
+	history := toChatMessages(p.Name, transcript)
 
 	queries := RewriteQueries(ctx, e.llm, e.cfg.LLM.Model, p, history, utterance)
 
@@ -113,40 +103,57 @@ func (e *Engine) Reply(ctx context.Context, conversationID uuid.UUID, utterance 
 	}
 	out <- Event{Type: "sources", Sources: sources}
 
-	systemPrompt := BuildSystemPrompt(p)
-	messages := make([]ChatMessage, 0, len(history)+2)
+	systemPrompt := BuildSystemPrompt(p, participants)
+	messages := make([]ChatMessage, 0, len(transcript)+2)
 	messages = append(messages, ChatMessage{Role: "system", Content: systemPrompt})
-	for _, m := range history {
-		messages = append(messages, ChatMessage{Role: m.Role, Content: m.Content})
+	// The meeting transcript can include statements from other personas, not
+	// just a strict user/assistant back-and-forth. Only this persona's own
+	// prior statements map to "assistant" — everything else (the human, and
+	// every other persona) rides as "user" with a 【speaker】 prefix so the
+	// model never has to guess who said what.
+	for _, t := range transcript {
+		if t.Role == "persona" && t.SpeakerName == p.Name {
+			messages = append(messages, ChatMessage{Role: "assistant", Content: t.Content})
+			continue
+		}
+		messages = append(messages, ChatMessage{
+			Role:    "user",
+			Content: fmt.Sprintf("【%s】%s", t.SpeakerName, t.Content),
+		})
 	}
-	// The documents block rides in the user turn, not system: system stays
-	// byte-identical across turns (see BuildSystemPrompt) so OpenAI's
-	// automatic prefix caching keeps working; putting per-turn content there
-	// would invalidate the cache on every message.
+	// The documents block rides in the final user turn, not system: system
+	// stays byte-identical across turns for the same persona+participants
+	// (see BuildSystemPrompt) so OpenAI's automatic prefix caching keeps
+	// working; putting per-turn content there would invalidate the cache on
+	// every message.
 	messages = append(messages, ChatMessage{Role: "user", Content: expanded + utterance})
 
-	reply, err := e.stream(ctx, conversationID, messages, out)
+	reply, err := e.stream(ctx, messages, out)
 	if err != nil {
 		return err
 	}
 
-	// A dropped client cancels ctx, but the reply the model already produced
-	// should still be saved — detach from the request's cancellation for the
-	// persistence step only.
-	saveCtx := context.WithoutCancel(ctx)
-	assistantMsg, err := e.store.AppendMessage(saveCtx, conversationID, "assistant", reply)
-	if err != nil {
-		return fmt.Errorf("reply: save assistant message: %w", err)
-	}
-	if err := e.store.SaveCitations(saveCtx, assistantMsg.ID, candidates); err != nil {
-		return fmt.Errorf("reply: save citations: %w", err)
-	}
-
-	out <- Event{Type: "done", Message: &assistantMsg}
+	out <- Event{Type: "done", Text: reply, Candidates: candidates}
 	return nil
 }
 
-func (e *Engine) stream(ctx context.Context, conversationID uuid.UUID, messages []ChatMessage, out chan<- Event) (string, error) {
+// toChatMessages renders the transcript into the shape RewriteQueries expects
+// for pronoun resolution — see prompt.go's buildRewritePrompt, which only
+// needs a short flattened role/content history, not the full 【speaker】
+// disambiguation that the generation prompt below needs.
+func toChatMessages(selfName string, transcript []Turn) []Message {
+	out := make([]Message, len(transcript))
+	for i, t := range transcript {
+		role := "user"
+		if t.Role == "persona" && t.SpeakerName == selfName {
+			role = "assistant"
+		}
+		out[i] = Message{Role: role, Content: t.Content}
+	}
+	return out
+}
+
+func (e *Engine) stream(ctx context.Context, messages []ChatMessage, out chan<- Event) (string, error) {
 	stream, err := e.llm.CreateChatCompletionStream(ctx, ChatRequest{
 		Model:    e.cfg.LLM.Model,
 		Stream:   true,
@@ -177,7 +184,7 @@ func (e *Engine) stream(ctx context.Context, conversationID uuid.UUID, messages 
 			out <- Event{Type: "token", Text: choice.Content}
 		}
 		if choice.FinishReason == "length" {
-			slog.Warn("reply truncated by max output", "conversation_id", conversationID)
+			slog.Warn("reply truncated by max output")
 		}
 	}
 	return sb.String(), nil

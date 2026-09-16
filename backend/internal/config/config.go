@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds runtime settings, all sourced from the environment so the
@@ -15,8 +16,9 @@ type Config struct {
 	// AllowedOrigins is the CORS allowlist for browser clients.
 	AllowedOrigins []string
 
-	// DatabaseURL is the Postgres DSN. The database must have pgvector.
-	DatabaseURL string
+	// Databases holds the four logical-database DSNs within the single
+	// Postgres instance. Each service opens exactly one — see dsn.go.
+	Databases DatabaseConfig
 
 	// ObjectStore holds the S3-compatible (MinIO) connection.
 	ObjectStore ObjectStoreConfig
@@ -32,6 +34,48 @@ type Config struct {
 
 	// Retrieval tunes the persona-weighted rerank.
 	Retrieval RetrievalConfig
+
+	// A2A configures a persona pod's own A2A server identity.
+	A2A A2AConfig
+
+	// Registry configures how a persona pod finds and talks to the discovery
+	// pod, and how the discovery pod itself is addressed by moderator.
+	Registry RegistryConfig
+
+	// Meeting tunes moderator's round-robin loop.
+	Meeting MeetingConfig
+
+	// PersonaSlug is which persona this cmd/persona process serves — it must
+	// match a row in kaigi_persona (see cmd/seed) and the pod's own manifest.
+	PersonaSlug string
+}
+
+// A2AConfig is a persona pod's own A2A server identity.
+type A2AConfig struct {
+	// PublicURL is this pod's own address as seen by OTHER pods (discovery
+	// resolving its card, moderator dialing it) — never "localhost". In
+	// compose this is the service name, in k8s the Service FQDN.
+	PublicURL string
+}
+
+// RegistryConfig points at the discovery pod (from a persona pod's side,
+// where to register; from moderator's side, where to list agents) and tunes
+// the heartbeat that keeps a registration alive.
+type RegistryConfig struct {
+	URL string
+	// HeartbeatInterval is how often a persona pod re-registers itself.
+	HeartbeatInterval time.Duration
+	// TTL is how long a registration is considered present after its last
+	// heartbeat. Kept at 3x HeartbeatInterval by convention (see Validate) so
+	// a single missed heartbeat does not flip a persona to absent.
+	TTL time.Duration
+}
+
+// MeetingConfig bounds how large a single meeting turn can grow.
+type MeetingConfig struct {
+	// MaxRounds caps how many rounds a single POST .../turns can request,
+	// regardless of what the client asks for — see meeting.Moderator.Run.
+	MaxRounds int
 }
 
 type ObjectStoreConfig struct {
@@ -86,12 +130,21 @@ type RetrievalConfig struct {
 	SkepticismSpan float64
 }
 
-func Load() Config {
+// Load reads Config from the environment. It only fails on a malformed
+// POSTGRES_BASE_URL (or an explicit per-database override) — everything
+// else falls back to a default, per the env/envInt/envFloat/envBool helpers
+// below.
+func Load() (Config, error) {
+	databases, err := loadDatabaseConfig()
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
 		Addr:           env("ADDR", ":8080"),
 		AllowedOrigins: splitAndTrim(env("ALLOWED_ORIGINS", "http://localhost:5173")),
-		DatabaseURL: env("DATABASE_URL",
-			"postgres://postgres:kaigi@localhost:5432/kaigi?sslmode=disable"),
+		Databases:      databases,
+		PersonaSlug:    env("PERSONA_SLUG", ""),
 		ObjectStore: ObjectStoreConfig{
 			Endpoint:       env("MINIO_ENDPOINT", "localhost:9000"),
 			PublicEndpoint: env("MINIO_PUBLIC_ENDPOINT", "localhost:9000"),
@@ -119,7 +172,18 @@ func Load() Config {
 			RelevanceFloor:   envFloat("RELEVANCE_FLOOR", 0.25),
 			SkepticismSpan:   envFloat("RELEVANCE_SKEPTICISM_SPAN", 0.20),
 		},
-	}
+		A2A: A2AConfig{
+			PublicURL: env("A2A_PUBLIC_URL", ""),
+		},
+		Registry: RegistryConfig{
+			URL:               env("REGISTRY_URL", "http://localhost:8081"),
+			HeartbeatInterval: envDuration("REGISTRY_HEARTBEAT_INTERVAL", 15*time.Second),
+			TTL:               envDuration("REGISTRY_TTL", 45*time.Second),
+		},
+		Meeting: MeetingConfig{
+			MaxRounds: envInt("MEETING_MAX_ROUNDS", 3),
+		},
+	}, nil
 }
 
 // Validate rejects configurations that would fail later at request time. The
@@ -140,6 +204,17 @@ func (c Config) Validate() error {
 	if c.Retrieval.RelevanceFloor < 0 || c.Retrieval.RelevanceFloor > 1 {
 		return fmt.Errorf("RELEVANCE_FLOOR must be within 0..1, got %v",
 			c.Retrieval.RelevanceFloor)
+	}
+	return nil
+}
+
+// ValidateRegistry checks the heartbeat/TTL relationship a persona pod's
+// registry.Client depends on: TTL must give a heartbeat at least one missed
+// beat of slack, or a single delayed heartbeat flips the persona to absent.
+func (c Config) ValidateRegistry() error {
+	if c.Registry.TTL <= c.Registry.HeartbeatInterval*2 {
+		return fmt.Errorf("REGISTRY_TTL (%s) must be more than 2x REGISTRY_HEARTBEAT_INTERVAL (%s)",
+			c.Registry.TTL, c.Registry.HeartbeatInterval)
 	}
 	return nil
 }
@@ -185,6 +260,18 @@ func envBool(key string, fallback bool) bool {
 		return fallback
 	}
 	return b
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fallback
+	}
+	return d
 }
 
 func splitAndTrim(s string) []string {

@@ -34,7 +34,11 @@ type Personality struct {
 }
 
 type Persona struct {
-	ID          uuid.UUID
+	ID uuid.UUID
+	// Slug is the persona pod's own stable identity — fixed in its
+	// Deployment manifest's PERSONA_SLUG, unlike ID which is a uuid that
+	// changes on every reseed. See persona.Store.GetBySlug.
+	Slug        string
 	Name        string
 	Personality Personality
 }

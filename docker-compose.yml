@@ -3,25 +3,41 @@ name: kaigi
 # Nothing here is production-shaped: credentials are the well-known defaults and
 # every port is published to the host.
 #
-# Two ways to run this stack:
-#   make up        -> postgres/minio only; the Go and Vite processes run on the
-#                     host via `make dev`, which is the hot-reload loop.
-#   make docker-up -> everything in containers, including backend and frontend.
-# The two are mutually exclusive: both want host port 8080.
+# Topology (see the plan's アーキテクチャ section for the full picture):
+#   postgres (1 instance, 4 databases) + minio
+#     <- discovery            (agent catalog)
+#     <- persona-critic, persona-pragmatist   (A2A servers, one per persona)
+#     <- moderator             (REST+SSE for the browser, A2A client to personas)
+#     <- frontend              (static SPA, Caddy proxies /api to moderator)
+#
+# Two ways to run the Go/Node side:
+#   make dev        -> discovery/persona/moderator/vite run as host processes
+#                       (make up starts postgres/minio only)
+#   make docker-up  -> everything in containers, including frontend
+# The two are mutually exclusive: both want the same host ports.
 
-# Shared by the API server and the one-shot seeder — same database, same bucket,
-# same API key.
-x-backend-env: &backend-env
-  DATABASE_URL: postgres://postgres:kaigi@postgres:5432/kaigi?sslmode=disable
-  # Inside the compose network MinIO answers to its service name, but presigned
-  # URLs are opened by the browser, which can only resolve the published host
-  # port. Splitting the two is exactly what these config fields exist for.
+# Shared by every backend-image service (moderator/discovery/persona/seed) —
+# same Postgres instance, same bucket, same OpenAI key where applicable.
+x-postgres-env: &postgres-env
+  # Inside the compose network Postgres answers to its service name; each
+  # service picks its own database by appending /kaigi_<name> — see
+  # config.loadDatabaseConfig.
+  POSTGRES_BASE_URL: postgres://postgres:kaigi@postgres:5432?sslmode=disable
+
+x-minio-env: &minio-env
   MINIO_ENDPOINT: minio:9000
+  # Presigned URLs are opened by the browser, which can only resolve the
+  # published host port — the same split ObjectStoreConfig.PublicEndpoint
+  # exists for in the pre-A2A single-backend layout.
   MINIO_PUBLIC_ENDPOINT: localhost:9000
-  ALLOWED_ORIGINS: http://localhost:5173
+  MINIO_BUCKET: kaigi-knowledge
 
-# minio-init has to have finished, not merely started: it is what creates the
-# bucket both services then write to and presign against.
+x-persona-env: &persona-env
+  <<: [*postgres-env, *minio-env]
+  REGISTRY_URL: http://discovery:8081
+
+# postgres/minio have to be healthy, and minio-init has to have finished (it
+# creates the bucket every backend service writes to and presigns against).
 x-backend-depends: &backend-depends
   postgres:
     condition: service_healthy
@@ -35,13 +51,20 @@ services:
     image: pgvector/pgvector:pg17
     environment:
       POSTGRES_PASSWORD: kaigi
-      POSTGRES_DB: kaigi
     ports:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # Runs once against the default `postgres` database on first boot only
+      # — see the file's own header comment and this compose file's GOTCHA
+      # note under Task 4 in the plan: a stale volume from before this
+      # topology existed will NOT get the four databases created, and every
+      # service will fail to boot with "database does not exist". Fix:
+      # `docker compose down -v` (or `docker volume rm kaigi_postgres-data`)
+      # and let this re-run against an empty volume.
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d kaigi"]
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -79,23 +102,85 @@ services:
         echo "bucket kaigi-knowledge ready"
     restart: "no"
 
-  backend:
+  discovery:
     build: ./backend
-    # required:false keeps `make up` working on a fresh clone that has not run
-    # `cp .env.example .env` yet. A missing OPENAI_API_KEY still fails loudly,
-    # but at boot with a named error rather than here with a file-not-found.
+    command: ["/app/discovery"]
     env_file:
       - path: .env
         required: false
-    environment: *backend-env
+    environment:
+      <<: *postgres-env
+      ADDR: ":8081"
     depends_on: *backend-depends
+    ports:
+      - "8081:8081"
+
+  # Two persona services, differing only in PERSONA_SLUG and A2A_PUBLIC_URL.
+  # A2A_PUBLIC_URL is this container's OWN address as seen by OTHER
+  # containers (discovery resolving its card, moderator dialing it) — never
+  # "localhost", which inside this container means itself, not the host.
+  # Adding a third persona is: copy one of these two blocks, change the slug
+  # and port, add a matching CreateInput to cmd/seed/main.go.
+  persona-critic:
+    build: ./backend
+    command: ["/app/persona"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      <<: *persona-env
+      ADDR: ":8082"
+      PERSONA_SLUG: critic
+      A2A_PUBLIC_URL: http://persona-critic:8082
+    depends_on:
+      <<: *backend-depends
+      discovery:
+        condition: service_started
+
+  persona-pragmatist:
+    build: ./backend
+    command: ["/app/persona"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      <<: *persona-env
+      ADDR: ":8083"
+      PERSONA_SLUG: pragmatist
+      A2A_PUBLIC_URL: http://persona-pragmatist:8083
+    depends_on:
+      <<: *backend-depends
+      discovery:
+        condition: service_started
+
+  moderator:
+    build: ./backend
+    command: ["/app/moderator"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      <<: *postgres-env
+      ADDR: ":8080"
+      ALLOWED_ORIGINS: http://localhost:5173
+      REGISTRY_URL: http://discovery:8081
+    depends_on:
+      <<: *backend-depends
+      discovery:
+        condition: service_started
     ports:
       - "8080:8080"
 
   frontend:
     build: ./frontend
+    environment:
+      # frontend and moderator are separate containers in compose (unlike
+      # the k8s frontend pod, where they share one pod's network namespace
+      # and the Caddyfile's localhost default applies) — see the Caddyfile's
+      # own comment on {$BACKEND_ADDR}.
+      BACKEND_ADDR: moderator:8080
     depends_on:
-      - backend
+      - moderator
     # Published on 5173 to match the Vite port the README and ALLOWED_ORIGINS
     # already use, so the URL is the same whichever way the stack is started.
     ports:
@@ -105,14 +190,17 @@ services:
   # run on demand: `docker compose run --rm seed` (or `make docker-seed`).
   seed:
     build: ./backend
-    # entrypoint, not command: the image's ENTRYPOINT is the server binary, and
-    # `command` would be appended to it as an argument rather than replacing it.
+    # entrypoint, not command: the image has no ENTRYPOINT (see
+    # backend/Dockerfile), so command alone would work too, but entrypoint
+    # makes it explicit that this service's identity is fixed, not
+    # overridable by an accidental `command:` elsewhere.
     entrypoint: ["/app/seed"]
     profiles: ["seed"]
     env_file:
       - path: .env
         required: false
-    environment: *backend-env
+    environment:
+      <<: [*postgres-env, *minio-env]
     depends_on: *backend-depends
     restart: "no"
 

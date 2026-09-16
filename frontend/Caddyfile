@@ -8,8 +8,15 @@
 	# straight through, which is what keeps the SSE endpoint
 	# (POST /api/conversations/{id}/messages) delivering tokens as they arrive
 	# instead of releasing them in one lump at the end.
+	# {$BACKEND_ADDR} lets the same built image serve two different pod
+	# shapes without a rebuild: in docker-compose, web and moderator are
+	# separate containers, so BACKEND_ADDR=moderator:8080 is set explicitly
+	# (see docker-compose.yml). In the k8s frontend pod, web and moderator
+	# are two containers sharing one pod's network namespace — moderator is
+	# genuinely reachable at localhost, which is the default when the env
+	# var is unset.
 	handle /api/* {
-		reverse_proxy backend:8080
+		reverse_proxy {$BACKEND_ADDR:localhost:8080}
 	}
 
 	# Everything else is the SPA. encode lives in this block rather than at the

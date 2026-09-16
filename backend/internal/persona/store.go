@@ -27,6 +27,11 @@ func NewStore(pool *pgxpool.Pool, embedder embedder) *Store {
 }
 
 type CreateInput struct {
+	// Slug is the persona pod's own identity — see Persona.Slug. Must match
+	// the PERSONA_SLUG a cmd/persona process is configured with; that
+	// contract lives between this seeder input and the pod manifests, not
+	// enforced in code.
+	Slug       string
 	Name       string
 	Stance     string
 	Verbosity  Verbosity
@@ -57,10 +62,10 @@ func (s *Store) Create(ctx context.Context, in CreateInput) (Persona, error) {
 
 	var id uuid.UUID
 	if err := tx.QueryRow(ctx, `
-		INSERT INTO personas (name, stance, verbosity, skepticism)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO personas (slug, name, stance, verbosity, skepticism)
+		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id
-	`, in.Name, in.Stance, string(verbosity), in.Skepticism).Scan(&id); err != nil {
+	`, in.Slug, in.Name, in.Stance, string(verbosity), in.Skepticism).Scan(&id); err != nil {
 		return Persona{}, fmt.Errorf("persona: insert: %w", err)
 	}
 
@@ -83,6 +88,7 @@ func (s *Store) Create(ctx context.Context, in CreateInput) (Persona, error) {
 
 	return Persona{
 		ID:   id,
+		Slug: in.Slug,
 		Name: in.Name,
 		Personality: Personality{
 			Stance:     in.Stance,
@@ -117,9 +123,9 @@ func (s *Store) Get(ctx context.Context, id uuid.UUID) (Persona, error) {
 	var verbosity string
 	p.ID = id
 	if err := s.pool.QueryRow(ctx, `
-		SELECT name, stance, verbosity, skepticism
+		SELECT slug, name, stance, verbosity, skepticism
 		FROM personas WHERE id = $1
-	`, id).Scan(&p.Name, &p.Personality.Stance, &verbosity, &p.Personality.Skepticism); err != nil {
+	`, id).Scan(&p.Slug, &p.Name, &p.Personality.Stance, &verbosity, &p.Personality.Skepticism); err != nil {
 		if err == pgx.ErrNoRows {
 			return Persona{}, fmt.Errorf("persona: %w", ErrNotFound)
 		}
@@ -135,9 +141,38 @@ func (s *Store) Get(ctx context.Context, id uuid.UUID) (Persona, error) {
 	return p, nil
 }
 
+// GetBySlug loads a persona by its pod identity (PERSONA_SLUG) rather than
+// its uuid — this is how cmd/persona resolves which row it serves at boot.
+// Interests are loaded with their embeddings (via interests, same as Get):
+// skipping the embedding here would silently zero out affinity in
+// retrieval.blend without any error — see the plan's GOTCHA on this exact
+// failure mode.
+func (s *Store) GetBySlug(ctx context.Context, slug string) (Persona, error) {
+	var p Persona
+	var verbosity string
+	p.Slug = slug
+	if err := s.pool.QueryRow(ctx, `
+		SELECT id, name, stance, verbosity, skepticism
+		FROM personas WHERE slug = $1
+	`, slug).Scan(&p.ID, &p.Name, &p.Personality.Stance, &verbosity, &p.Personality.Skepticism); err != nil {
+		if err == pgx.ErrNoRows {
+			return Persona{}, fmt.Errorf("persona: %w", ErrNotFound)
+		}
+		return Persona{}, fmt.Errorf("persona: get by slug: %w", err)
+	}
+	p.Personality.Verbosity = Verbosity(verbosity)
+
+	interests, err := s.interests(ctx, p.ID)
+	if err != nil {
+		return Persona{}, err
+	}
+	p.Personality.Interests = interests
+	return p, nil
+}
+
 func (s *Store) List(ctx context.Context) ([]Persona, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, stance, verbosity, skepticism FROM personas ORDER BY created_at
+		SELECT id, slug, name, stance, verbosity, skepticism FROM personas ORDER BY slug
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("persona: list: %w", err)
@@ -148,7 +183,7 @@ func (s *Store) List(ctx context.Context) ([]Persona, error) {
 	for rows.Next() {
 		var p Persona
 		var verbosity string
-		if err := rows.Scan(&p.ID, &p.Name, &p.Personality.Stance, &verbosity, &p.Personality.Skepticism); err != nil {
+		if err := rows.Scan(&p.ID, &p.Slug, &p.Name, &p.Personality.Stance, &verbosity, &p.Personality.Skepticism); err != nil {
 			return nil, fmt.Errorf("persona: scan: %w", err)
 		}
 		p.Personality.Verbosity = Verbosity(verbosity)

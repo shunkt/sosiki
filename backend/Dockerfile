@@ -1,6 +1,7 @@
-# Two binaries come out of this build: the API server and the one-shot seeder.
-# They share a module and a build cache, so building them together is cheaper
-# than two images, and the compose `seed` service just overrides the command.
+# Four binaries come out of this build: moderator, discovery, persona, and
+# the one-shot seeder. They share a module and a build cache, so building
+# them together is cheaper than four images, and each compose/k8s service
+# just picks its own binary via `command`.
 FROM golang:1.26 AS build
 
 WORKDIR /src
@@ -12,10 +13,12 @@ RUN go mod download
 
 COPY . .
 
-# CGO_ENABLED=0 makes both binaries statically linked, which is what lets the
+# CGO_ENABLED=0 makes every binary statically linked, which is what lets the
 # runtime stage be distroless/static — no libc, no shell, nothing to patch.
-RUN CGO_ENABLED=0 go build -o /out/server ./cmd/server && \
-    CGO_ENABLED=0 go build -o /out/seed ./cmd/seed
+RUN CGO_ENABLED=0 go build -o /out/moderator ./cmd/moderator && \
+    CGO_ENABLED=0 go build -o /out/discovery ./cmd/discovery && \
+    CGO_ENABLED=0 go build -o /out/persona   ./cmd/persona   && \
+    CGO_ENABLED=0 go build -o /out/seed      ./cmd/seed
 
 FROM gcr.io/distroless/static-debian12 AS runtime
 
@@ -23,11 +26,13 @@ FROM gcr.io/distroless/static-debian12 AS runtime
 # the working directory has to be the one holding that tree.
 WORKDIR /app
 
-COPY --from=build /out/server /app/server
-COPY --from=build /out/seed /app/seed
+COPY --from=build /out/moderator /app/moderator
+COPY --from=build /out/discovery /app/discovery
+COPY --from=build /out/persona   /app/persona
+COPY --from=build /out/seed      /app/seed
 COPY testdata /app/testdata
 
-EXPOSE 8080
-
-# Exec form is mandatory: distroless has no shell to interpret a string form.
-ENTRYPOINT ["/app/server"]
+# No EXPOSE / ENTRYPOINT here on purpose: which binary a container runs, and
+# on which ADDR, is a per-service choice (see docker-compose.yml's
+# `command:` and k8s/base/*.yaml) — none of the four is a sensible default
+# for the image as a whole.

@@ -1,4 +1,5 @@
-// Package api wires the HTTP routes and handlers for the kaigi backend.
+// Package api wires the HTTP routes and handlers for the moderator: the one
+// pod that speaks plain REST+SSE to the browser and A2A to persona pods.
 package api
 
 import (
@@ -11,29 +12,34 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/shun/kaigi/backend/internal/chat"
 	"github.com/shun/kaigi/backend/internal/config"
-	"github.com/shun/kaigi/backend/internal/objectstore"
-	"github.com/shun/kaigi/backend/internal/persona"
+	"github.com/shun/kaigi/backend/internal/meeting"
+	"github.com/shun/kaigi/backend/internal/registry"
 )
 
-// chatEngine is the one seam interfaced here (satisfied by *chat.Engine):
-// the SSE handler's frame-by-frame behavior needs to be testable without a
-// live OpenAI/Postgres/MinIO stack. Personas/ChatStore/Objects stay
-// concrete — their handlers are covered by the integration tests already
-// established for their packages (persona, chat, objectstore), not fakes.
-type chatEngine interface {
-	Reply(ctx context.Context, conversationID uuid.UUID, utterance string, out chan<- chat.Event) error
+// moderatorRunner is the one seam interfaced here (satisfied by
+// *meeting.Moderator): the SSE handler's frame-by-frame behavior needs to be
+// testable without live persona pods — the same pattern the pre-A2A chatEngine
+// seam used for chat.Engine.
+type moderatorRunner interface {
+	Run(ctx context.Context, meetingID uuid.UUID, utterance string, rounds int, out chan<- meeting.Event) error
+}
+
+// agentLister is the seam over the discovery pod's HTTP API, so
+// handleListPersonas can be tested without a live discovery pod.
+type agentLister interface {
+	ListAgents(ctx context.Context) ([]registry.AgentDTO, error)
 }
 
 // Deps are the dependencies NewHandler wires into routes.
 type Deps struct {
 	Log       *slog.Logger
-	Pool      *pgxpool.Pool
-	Personas  *persona.Store
-	Chat      chatEngine
-	ChatStore *chat.Store
-	Objects   *objectstore.Store
+	Pool      *pgxpool.Pool // kaigi_meeting
+	Meetings  *meeting.Store
+	Moderator moderatorRunner
+	Agents    agentLister
+	// DefaultRounds is used when a turn request omits rounds.
+	DefaultRounds int
 }
 
 type handlers struct {
@@ -41,7 +47,7 @@ type handlers struct {
 	deps Deps
 }
 
-// NewHandler builds the fully wrapped HTTP handler for the service.
+// NewHandler builds the fully wrapped HTTP handler for the moderator.
 func NewHandler(cfg config.Config, d Deps) http.Handler {
 	h := &handlers{cfg: cfg, deps: d}
 
@@ -49,15 +55,10 @@ func NewHandler(cfg config.Config, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/health", h.handleHealth)
 
 	mux.HandleFunc("GET /api/personas", h.handleListPersonas)
-	mux.HandleFunc("POST /api/personas", h.handleCreatePersona)
-	mux.HandleFunc("GET /api/personas/{id}", h.handleGetPersona)
-	mux.HandleFunc("PATCH /api/personas/{id}", h.handleUpdatePersona)
 
-	mux.HandleFunc("POST /api/conversations", h.handleCreateConversation)
-	mux.HandleFunc("GET /api/conversations/{id}", h.handleGetConversation)
-	mux.HandleFunc("POST /api/conversations/{id}/messages", h.handleSendMessage)
-
-	mux.HandleFunc("GET /api/documents/{id}", h.handleGetDocument)
+	mux.HandleFunc("POST /api/meetings", h.handleCreateMeeting)
+	mux.HandleFunc("GET /api/meetings/{id}", h.handleGetMeeting)
+	mux.HandleFunc("POST /api/meetings/{id}/turns", h.handleSendTurn)
 
 	return requestLogger(d.Log, cors(cfg.AllowedOrigins, mux))
 }
@@ -68,16 +69,8 @@ const healthCheckTimeout = 2 * time.Second
 
 func (h *handlers) handleHealth(w http.ResponseWriter, r *http.Request) {
 	status := map[string]string{"status": "ok"}
-
-	// A dependency being unreachable makes the response "degraded", not a
-	// 5xx: the process itself is healthy even if a downstream isn't, and a
-	// failing health check must not be what takes the container down.
 	degraded := false
 
-	// The embedding and chat providers are not probed: both are third-party
-	// HTTP APIs with no free liveness endpoint, and billing a request per
-	// health check to learn something the next real request reports anyway
-	// is not a trade worth making.
 	switch {
 	case h.deps.Pool == nil:
 		status["db"] = "unconfigured"

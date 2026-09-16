@@ -7,6 +7,12 @@ dist/
 /backend/bin/
 *.test
 coverage.out
+# `go build ./cmd/x/...` (no -o) drops a binary named after the package
+# directly in backend/ — these are exactly cmd/*'s directory names.
+/backend/discovery
+/backend/moderator
+/backend/persona
+/backend/seed
 
 # Env
 .env

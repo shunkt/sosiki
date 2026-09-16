@@ -16,36 +16,6 @@ import (
 
 // --- fakes ---
 
-type fakeStore struct {
-	persona          persona.Persona
-	history          []Message
-	appended         []Message
-	savedCitations   []retrieval.Candidate
-	appendMessageErr error
-}
-
-func (f *fakeStore) PersonaFor(context.Context, uuid.UUID) (persona.Persona, error) {
-	return f.persona, nil
-}
-
-func (f *fakeStore) History(context.Context, uuid.UUID, int) ([]Message, error) {
-	return f.history, nil
-}
-
-func (f *fakeStore) AppendMessage(_ context.Context, _ uuid.UUID, role, content string) (Message, error) {
-	if f.appendMessageErr != nil {
-		return Message{}, f.appendMessageErr
-	}
-	m := Message{ID: uuid.New(), Role: role, Content: content}
-	f.appended = append(f.appended, m)
-	return m, nil
-}
-
-func (f *fakeStore) SaveCitations(_ context.Context, _ uuid.UUID, candidates []retrieval.Candidate) error {
-	f.savedCitations = candidates
-	return nil
-}
-
 type fakeSearcher struct {
 	candidates []retrieval.Candidate
 }
@@ -96,19 +66,18 @@ func (f *fakeLLMStream) Recv() (ChatStreamChunk, error) {
 
 func (f *fakeLLMStream) Close() error { return nil }
 
-func testEngine(llm *fakeLLMStream, store *fakeStore, cands []retrieval.Candidate) *Engine {
-	e := NewEngine(llm, nil, nil, nil, config.Config{
+func testEngine(llm *fakeLLMStream, cands []retrieval.Candidate) *Engine {
+	e := NewEngine(llm, nil, nil, config.Config{
 		LLM:       config.LLMConfig{Model: "gpt-5-mini"},
 		Retrieval: config.RetrievalConfig{ContextPadBytes: 100},
 	})
 	e.searcher = fakeSearcher{candidates: cands}
 	e.objects = fakeObjects{}
-	e.store = store
 	return e
 }
 
 func TestEngineEmitsEventOrder(t *testing.T) {
-	store := &fakeStore{persona: persona.Persona{Name: "test"}}
+	p := persona.Persona{Name: "test"}
 	cand := retrieval.Candidate{ChunkID: uuid.New(), DocumentID: uuid.New(), Title: "doc"}
 	llm := &fakeLLMStream{
 		llm: ChatResponse{Content: `{"queries": ["q"]}`},
@@ -117,10 +86,10 @@ func TestEngineEmitsEventOrder(t *testing.T) {
 			{Choices: []ChatStreamChoice{{Content: "にちは"}}},
 		},
 	}
-	e := testEngine(llm, store, []retrieval.Candidate{cand})
+	e := testEngine(llm, []retrieval.Candidate{cand})
 
 	out := make(chan Event, 10)
-	if err := e.Reply(context.Background(), uuid.New(), "hi", out); err != nil {
+	if err := e.Reply(context.Background(), p, []string{"test"}, nil, "hi", out); err != nil {
 		t.Fatalf("Reply: %v", err)
 	}
 	close(out)
@@ -142,20 +111,19 @@ func TestEngineEmitsEventOrder(t *testing.T) {
 	if events[2].Type != "token" || events[2].Text != "にちは" {
 		t.Errorf("event[2] = %+v, want token にちは", events[2])
 	}
-	if events[3].Type != "done" || events[3].Message == nil {
-		t.Errorf("event[3] = %+v, want done with a message", events[3])
+	if events[3].Type != "done" {
+		t.Errorf("event[3] = %+v, want done", events[3])
 	}
-	if events[3].Message.Content != "こんにちは" {
-		t.Errorf("saved assistant content = %q, want こんにちは", events[3].Message.Content)
+	if events[3].Text != "こんにちは" {
+		t.Errorf("done reply text = %q, want こんにちは", events[3].Text)
 	}
-
-	if len(store.savedCitations) != 1 {
-		t.Errorf("saved %d citations, want 1", len(store.savedCitations))
+	if len(events[3].Candidates) != 1 {
+		t.Errorf("done candidates = %d, want 1 (the caller persists these, not Engine)", len(events[3].Candidates))
 	}
 }
 
 func TestEngineSkipsEmptyChoices(t *testing.T) {
-	store := &fakeStore{persona: persona.Persona{Name: "test"}}
+	p := persona.Persona{Name: "test"}
 	llm := &fakeLLMStream{
 		llm: ChatResponse{Content: `{"queries": ["q"]}`},
 		chunks: []ChatStreamChunk{
@@ -163,10 +131,10 @@ func TestEngineSkipsEmptyChoices(t *testing.T) {
 			{Choices: []ChatStreamChoice{{Content: "ok"}}},
 		},
 	}
-	e := testEngine(llm, store, nil)
+	e := testEngine(llm, nil)
 
 	out := make(chan Event, 10)
-	if err := e.Reply(context.Background(), uuid.New(), "hi", out); err != nil {
+	if err := e.Reply(context.Background(), p, []string{"test"}, nil, "hi", out); err != nil {
 		t.Fatalf("Reply: %v", err)
 	}
 	close(out)
@@ -183,30 +151,30 @@ func TestEngineSkipsEmptyChoices(t *testing.T) {
 }
 
 func TestEngineReturnsErrorOnStreamFailure(t *testing.T) {
-	store := &fakeStore{persona: persona.Persona{Name: "test"}}
+	p := persona.Persona{Name: "test"}
 	llm := &fakeLLMStream{
 		llm:     ChatResponse{Content: `{"queries": ["q"]}`},
 		recvErr: errors.New("connection reset"),
 	}
-	e := testEngine(llm, store, nil)
+	e := testEngine(llm, nil)
 
 	out := make(chan Event, 10)
-	err := e.Reply(context.Background(), uuid.New(), "hi", out)
+	err := e.Reply(context.Background(), p, []string{"test"}, nil, "hi", out)
 	if err == nil {
 		t.Fatal("expected an error from Reply when the stream fails")
 	}
 }
 
 func TestEngineHandlesNoCandidates(t *testing.T) {
-	store := &fakeStore{persona: persona.Persona{Name: "test"}}
+	p := persona.Persona{Name: "test"}
 	llm := &fakeLLMStream{
 		llm:    ChatResponse{Content: `{"queries": ["q"]}`},
 		chunks: []ChatStreamChunk{{Choices: []ChatStreamChoice{{Content: "no sources"}}}},
 	}
-	e := testEngine(llm, store, nil) // nil candidates: everything was filtered by skepticism
+	e := testEngine(llm, nil) // nil candidates: everything was filtered by skepticism
 
 	out := make(chan Event, 10)
-	if err := e.Reply(context.Background(), uuid.New(), "hi", out); err != nil {
+	if err := e.Reply(context.Background(), p, []string{"test"}, nil, "hi", out); err != nil {
 		t.Fatalf("Reply: %v", err)
 	}
 	close(out)
@@ -222,5 +190,48 @@ func TestEngineHandlesNoCandidates(t *testing.T) {
 	}
 	if !gotSources {
 		t.Error("expected a sources event even with zero candidates")
+	}
+}
+
+// TestEngineUsesTranscriptForOtherSpeakers exercises the 【speaker】 wrapping
+// that lets a persona see a meeting's earlier turns from other speakers —
+// this is the mechanism meeting.Moderator relies on for personas to react to
+// each other's statements (see the plan's TestModeratorRounds).
+func TestEngineUsesTranscriptForOtherSpeakers(t *testing.T) {
+	p := persona.Persona{Name: "実務家"}
+	llm := &fakeLLMStream{
+		llm:    ChatResponse{Content: `{"queries": ["q"]}`},
+		chunks: []ChatStreamChunk{{Choices: []ChatStreamChoice{{Content: "ok"}}}},
+	}
+	e := testEngine(llm, nil)
+
+	transcript := []Turn{
+		{Role: "user", SpeakerName: "user", Content: "議題です"},
+		{Role: "persona", SpeakerName: "批評家", Content: "批評家の発言です"},
+		{Role: "persona", SpeakerName: "実務家", Content: "自分の前の発言です"},
+	}
+
+	out := make(chan Event, 10)
+	if err := e.Reply(context.Background(), p, []string{"批評家", "実務家"}, transcript, "続き", out); err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	close(out)
+	for range out {
+	}
+
+	// Indirect check: toChatMessages is what actually builds the LLM-bound
+	// history. Exercise it directly for a precise assertion on role mapping.
+	msgs := toChatMessages(p.Name, transcript)
+	if len(msgs) != 3 {
+		t.Fatalf("got %d messages, want 3", len(msgs))
+	}
+	if msgs[0].Role != "user" {
+		t.Errorf("human turn role = %q, want user", msgs[0].Role)
+	}
+	if msgs[1].Role != "user" {
+		t.Errorf("other persona's turn role = %q, want user (not assistant)", msgs[1].Role)
+	}
+	if msgs[2].Role != "assistant" {
+		t.Errorf("own prior turn role = %q, want assistant", msgs[2].Role)
 	}
 }
