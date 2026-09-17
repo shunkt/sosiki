@@ -4,9 +4,9 @@
 
 単一プロセスの kaigi バックエンドを、A2A（Agent2Agent）プロトコルで会話する4種類の独立サービスに解体した。ペルソナは1体1プロセスの A2A サーバーになり、moderator が会議録を共有しながら参加者を逐次呼び出すことで、ペルソナが互いの発言に反応する会議を実現する。
 
-**ステータス: Task 1-21（Go バックエンドのコア + Docker Compose 化）完了。Task 22-26（k8s マニフェスト・kind・フロントエンド全面改修）は未着手。**
+**ステータス: 全26タスク完了。**
 
-段階的実行についてユーザーの承認を得ながら3フェーズに分けて進行し、フェーズ1・2の完了時点でセッションコストが高額になったため、ここで一旦区切ってコミットした。
+段階的実行についてユーザーの承認を得ながら3フェーズ（Go バックエンドのコア / Docker Compose 化 / k8s+フロントエンド）に分けて進行し、各フェーズの完了ごとにコミットした。フェーズ3では実際に kind クラスタを構築し、Ingress 経由で実 OpenAI 生成を含む完全な会議ターンが動作することまで確認済み。
 
 ## Assessment vs Reality
 
@@ -41,11 +41,11 @@
 | 19 | cmd/seed を分割DBに対応 | ✅ Complete | |
 | 20 | Dockerfile を3バイナリに | ✅ Complete（実際は4バイナリ） | moderator/discovery/persona/seed |
 | 21 | docker-compose.yml を新トポロジに | ✅ Complete | `docker compose up` で全8サービス起動を実機確認 |
-| 22 | k8s マニフェスト（base） | ⬜ Not started | |
-| 23 | k8s overlay と kind クラスタ | ⬜ Not started | `kind` 未インストール |
-| 24 | フロントエンドの API クライアント | ⬜ Not started | |
-| 25 | フロントエンドの会議 UI | ⬜ Not started | |
-| 26 | Makefile / .env.example / README | ⬜ Not started | |
+| 22 | k8s マニフェスト（base） | ✅ Complete | 実際の kind クラスタで apply・全Pod Running を確認 |
+| 23 | k8s overlay と kind クラスタ | ✅ Complete | `kind` を公式バイナリで直接インストール（Homebrew は Xcode ライセンス要求で断念）。`configMapGenerator`/`secretGenerator` の namespace 解決バグを踏み、直接パッチ方式に変更 |
+| 24 | フロントエンドの API クライアント | ✅ Complete | |
+| 25 | フロントエンドの会議 UI | ✅ Complete | 実機（kind + Ingress）で実 OpenAI 生成による完全な会議ターンを確認 |
+| 26 | Makefile / .env.example / README | ✅ Complete | |
 
 ## Validation Results
 
@@ -103,6 +103,12 @@
 
 3. **マイグレーションの並行実行レース**: `docker compose up` で複数の persona pod が同時起動すると、共有DBである `kaigi_persona`/`kaigi_knowledge` への `CREATE EXTENSION IF NOT EXISTS` が競合し `duplicate key value violates unique constraint "pg_extension_name_index"` で失敗することを実機で確認。`db.Migrate` に `pg_advisory_lock` を追加し、実際に5並行での `db.New` 呼び出しを再現する統合テストも追加した。
 
+4. **SSEイベントのJSONキー不整合**: `meeting.Turn`/`Citation`/`Participant` に `json` タグが無く、REST API（DTO層経由で camelCase）と SSE（`meeting.Event` を直接 marshal するため Go の既定 PascalCase）でフィールド名が食い違っていた。実際にキャプチャした SSE ストリームを見て発覚。フロントエンドの型と一致するよう `json` タグを追加し、JSON キーの形式を直接検証する回帰テストを追加した。
+
+5.（k8sデプロイ特有）**`minio/minio:latest`/`minio/mc:latest` が匿名 pull 不可**: Docker Hub 側の変更で `pull access denied` になった。`quay.io/minio/minio`・`quay.io/minio/mc`（同一イメージのミラー）に切り替えて解決。
+
+6.（k8sデプロイ特有）**`kind load docker-image`/`image-archive` が multi-platform マニフェストで失敗**: kind v0.30.0 で `ctr images import --all-platforms` が欠けているプラットフォームのコンテンツダイジェストを要求し失敗する既知の問題に遭遇（`docker save` 経由でも同様）。quay.io への切り替えで kind ノードが直接 pull するようになり、この問題を回避。
+
 ## Tests Written
 
 | Test File | Tests | Coverage |
@@ -120,9 +126,18 @@
 
 合計 約90テスト、全て `-race` 付きで PASS。
 
+## Validation Results（Task 22-26 追加分）
+
+| Level | Status | Notes |
+|---|---|---|
+| `kubectl kustomize` (base / overlay) | ✅ Pass | |
+| 実際の kind クラスタへの apply | ✅ Pass | 全7 Workload Pod（discovery/persona×2/frontend/postgres/minio + seed Job）が Running/Completed |
+| k8s Ingress 経由の疎通 | ✅ Pass | `/api/health`・`/api/personas`・SPA配信 |
+| **k8s 経由の実機E2E（実 OpenAI 生成）** | ✅ Pass | Ingress 経由で会議ターン送信 → `speaker_start`→`sources`→236個の`token`→`speaker_end`→`round_end`→`done`、camelCase JSON キー確認済み |
+| frontend `npm run build` / `npm run lint` | ✅ Pass | |
+
 ## Next Steps
 
 - [ ] `/code-review` でこのコミットのレビュー
-- [ ] Task 22-26（k8s マニフェスト、kind クラスタ、フロントエンド会議UI、Makefile/README更新）— 別セッション推奨
-- [ ] `kind` のインストール
 - [ ] PR 作成（`/prp-pr` または `gh pr create`）
+- [ ] （任意）3体目以降のペルソナ追加、ペルソナ間メッシュ型通信への拡張検討
