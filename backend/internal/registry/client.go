@@ -90,15 +90,26 @@ func (c *Client) registerOnce(ctx context.Context) {
 	c.Log.Info("registry: registered", "slug", c.Slug)
 }
 
+// Skill is the subset of a2a.AgentSkill the frontend renders in the
+// participant picker (see the plan's UX Design) — a tag list per persona.
+type Skill struct {
+	ID   string   `json:"id"`
+	Name string   `json:"name"`
+	Tags []string `json:"tags"`
+}
+
 // AgentDTO is the shape the discovery pod returns from GET
-// /registry/agents{,/{slug}} — kept here (not in internal/agentapi) so both
-// the persona-pod-side client and the moderator-side dialer share one
-// definition of what a registry response looks like.
+// /registry/agents{,/{slug}} — kept here (not in internal/agentapi) so the
+// persona-pod-side client, the moderator-side dialer, AND discovery's own
+// handler (internal/agentapi) share one definition of what a registry
+// response looks like, rather than agentapi keeping a second, easily
+// drifting copy of the same shape.
 type AgentDTO struct {
 	Slug      string         `json:"slug"`
 	Name      string         `json:"name"`
 	PersonaID string         `json:"personaId"`
 	BaseURL   string         `json:"baseUrl"`
 	Present   bool           `json:"present"`
+	Skills    []Skill        `json:"skills"`
 	Card      *a2a.AgentCard `json:"card"`
 }

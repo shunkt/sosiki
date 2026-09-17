@@ -11,8 +11,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
@@ -26,6 +24,7 @@ import (
 	"github.com/shun/kaigi/backend/internal/personaexec"
 	"github.com/shun/kaigi/backend/internal/registry"
 	"github.com/shun/kaigi/backend/internal/retrieval"
+	"github.com/shun/kaigi/backend/internal/serve"
 )
 
 func main() {
@@ -117,36 +116,10 @@ func run(log *slog.Logger) error {
 	defer regCancel()
 	go regClient.Run(regCtx)
 
-	srv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		// ReadTimeout and WriteTimeout stay unset: A2A's SendStreamingMessage
-		// holds the connection open for the whole reply, and either timeout
-		// would cut it off mid-turn — same reasoning as the moderator's SSE
-		// server.
-		IdleTimeout: 60 * time.Second,
-	}
-
-	errCh := make(chan error, 1)
-	go func() {
-		log.Info("listening", "addr", cfg.Addr, "persona_slug", cfg.PersonaSlug, "public_url", cfg.A2A.PublicURL)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-		}
-	}()
-
-	stopCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	select {
-	case err := <-errCh:
-		return err
-	case <-stopCtx.Done():
-		log.Info("shutting down")
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	log.Info("starting", "persona_slug", cfg.PersonaSlug, "public_url", cfg.A2A.PublicURL)
+	// ReadTimeout/WriteTimeout stay unset inside serve.Run: A2A's
+	// SendStreamingMessage holds the connection open for the whole reply,
+	// and either timeout would cut it off mid-turn — same reasoning as the
+	// moderator's SSE server.
+	return serve.Run(ctx, log, cfg.Addr, mux)
 }

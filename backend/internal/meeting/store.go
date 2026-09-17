@@ -137,14 +137,22 @@ func (s *Store) Transcript(ctx context.Context, meetingID uuid.UUID) ([]Turn, er
 		return nil, fmt.Errorf("meeting: iterate turns: %w", err)
 	}
 
+	byTurn, err := s.citationsByTurn(ctx, turnIDs(out))
+	if err != nil {
+		return nil, err
+	}
 	for i := range out {
-		citations, err := s.citations(ctx, out[i].ID)
-		if err != nil {
-			return nil, err
-		}
-		out[i].Citations = citations
+		out[i].Citations = byTurn[out[i].ID]
 	}
 	return out, nil
+}
+
+func turnIDs(turns []Turn) []uuid.UUID {
+	out := make([]uuid.UUID, len(turns))
+	for i, t := range turns {
+		out[i] = t.ID
+	}
+	return out
 }
 
 // AppendTurn assigns the next seq for the meeting and inserts the turn in
@@ -214,25 +222,37 @@ func (s *Store) SaveCitations(ctx context.Context, turnID uuid.UUID, cs []Citati
 	return tx.Commit(ctx)
 }
 
-func (s *Store) citations(ctx context.Context, turnID uuid.UUID) ([]Citation, error) {
+// citationsByTurn loads every citation for the given turns in one query
+// (WHERE turn_id = ANY($1)) rather than one query per turn — Transcript used
+// to call a per-turn citations() in a loop, which meant a 3-round meeting
+// with 4 personas issued dozens of avoidable round trips per turn sent
+// (moderator.runOneTurn calls Transcript fresh before every single
+// participant's turn — see its own doc comment on why). Caught by code
+// review, not by any test: the N+1 pattern is correct, just slow.
+func (s *Store) citationsByTurn(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]Citation, error) {
+	out := make(map[uuid.UUID][]Citation, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+
 	rows, err := s.pool.Query(ctx, `
-		SELECT chunk_id, document_id, rank, title, object_key, relevance_score, affinity_score
+		SELECT turn_id, chunk_id, document_id, rank, title, object_key, relevance_score, affinity_score
 		FROM turn_citations
-		WHERE turn_id = $1
-		ORDER BY rank
-	`, turnID)
+		WHERE turn_id = ANY($1)
+		ORDER BY turn_id, rank
+	`, ids)
 	if err != nil {
 		return nil, fmt.Errorf("meeting: citations: %w", err)
 	}
 	defer rows.Close()
 
-	var out []Citation
 	for rows.Next() {
+		var turnID uuid.UUID
 		var c Citation
-		if err := rows.Scan(&c.ChunkID, &c.DocumentID, &c.Rank, &c.Title, &c.ObjectKey, &c.Relevance, &c.Affinity); err != nil {
+		if err := rows.Scan(&turnID, &c.ChunkID, &c.DocumentID, &c.Rank, &c.Title, &c.ObjectKey, &c.Relevance, &c.Affinity); err != nil {
 			return nil, fmt.Errorf("meeting: scan citation: %w", err)
 		}
-		out = append(out, c)
+		out[turnID] = append(out[turnID], c)
 	}
 	return out, rows.Err()
 }

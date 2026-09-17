@@ -198,7 +198,7 @@ func TestEngineHandlesNoCandidates(t *testing.T) {
 // this is the mechanism meeting.Moderator relies on for personas to react to
 // each other's statements (see the plan's TestModeratorRounds).
 func TestEngineUsesTranscriptForOtherSpeakers(t *testing.T) {
-	p := persona.Persona{Name: "実務家"}
+	p := persona.Persona{Slug: "pragmatist", Name: "実務家"}
 	llm := &fakeLLMStream{
 		llm:    ChatResponse{Content: `{"queries": ["q"]}`},
 		chunks: []ChatStreamChunk{{Choices: []ChatStreamChoice{{Content: "ok"}}}},
@@ -207,8 +207,8 @@ func TestEngineUsesTranscriptForOtherSpeakers(t *testing.T) {
 
 	transcript := []Turn{
 		{Role: "user", SpeakerName: "user", Content: "議題です"},
-		{Role: "persona", SpeakerName: "批評家", Content: "批評家の発言です"},
-		{Role: "persona", SpeakerName: "実務家", Content: "自分の前の発言です"},
+		{Role: "persona", SpeakerSlug: "critic", SpeakerName: "批評家", Content: "批評家の発言です"},
+		{Role: "persona", SpeakerSlug: "pragmatist", SpeakerName: "実務家", Content: "自分の前の発言です"},
 	}
 
 	out := make(chan Event, 10)
@@ -221,7 +221,7 @@ func TestEngineUsesTranscriptForOtherSpeakers(t *testing.T) {
 
 	// Indirect check: toChatMessages is what actually builds the LLM-bound
 	// history. Exercise it directly for a precise assertion on role mapping.
-	msgs := toChatMessages(p.Name, transcript)
+	msgs := toChatMessages(p.Slug, transcript)
 	if len(msgs) != 3 {
 		t.Fatalf("got %d messages, want 3", len(msgs))
 	}
@@ -233,5 +233,47 @@ func TestEngineUsesTranscriptForOtherSpeakers(t *testing.T) {
 	}
 	if msgs[2].Role != "assistant" {
 		t.Errorf("own prior turn role = %q, want assistant", msgs[2].Role)
+	}
+}
+
+// TestReplyReturnsPromptlyWhenConsumerStopsReading is the regression test
+// for the code-review finding: every out<-Event inside Reply/stream used to
+// be a plain blocking send with no select on ctx, so a consumer that
+// disappears mid-stream (the moderator's SSE handler returning on client
+// disconnect, or personaexec.Executor's iterator stopping early) could
+// leave this goroutine parked forever on a full, unread channel — ctx
+// cancellation alone does not unblock an in-flight channel send. Uses an
+// UNBUFFERED out with no reader at all so the only way Reply can return is
+// via sendEvent's ctx branch, not by luck of a buffer absorbing every send.
+func TestReplyReturnsPromptlyWhenConsumerStopsReading(t *testing.T) {
+	p := persona.Persona{Name: "test"}
+	// Enough chunks that, on a buffered channel, sends would previously have
+	// gone through regardless — the unbuffered channel below is what forces
+	// every send through sendEvent's select.
+	chunks := make([]ChatStreamChunk, 50)
+	for i := range chunks {
+		chunks[i] = ChatStreamChunk{Choices: []ChatStreamChoice{{Content: "x"}}}
+	}
+	llm := &fakeLLMStream{llm: ChatResponse{Content: `{"queries": ["q"]}`}, chunks: chunks}
+	e := testEngine(llm, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan Event) // unbuffered, and nothing ever reads from it
+
+	done := make(chan error, 1)
+	go func() { done <- e.Reply(ctx, p, []string{"test"}, nil, "hi", out) }()
+
+	// Give Reply a moment to reach its first send (the "sources" event),
+	// where it will now be permanently blocked absent the ctx-aware fix.
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("Reply returned nil error after ctx cancellation, want ctx.Err()")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Reply did not return after ctx was canceled — goroutine leaked (regression)")
 	}
 }

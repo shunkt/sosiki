@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/google/uuid"
@@ -309,5 +310,44 @@ func TestModeratorNoParticipants(t *testing.T) {
 	close(out)
 	if err != ErrNoParticipants {
 		t.Errorf("Run error = %v, want ErrNoParticipants", err)
+	}
+}
+
+// TestRunReturnsPromptlyWhenConsumerStopsReading is the regression test for
+// the code-review finding: every out<-Event inside Run/runOneTurn used to be
+// a plain blocking send with no select on ctx, so a client that disconnects
+// mid-meeting (internal/api/turns.go's SSE handler returning on
+// r.Context().Done() without draining events) could leave this goroutine
+// parked forever the moment the channel's buffer filled — ctx cancellation
+// alone does not unblock an in-flight channel send. Uses an UNBUFFERED out
+// with no reader at all, so even the very first event (speaker_start) would
+// deadlock without the fix.
+func TestRunReturnsPromptlyWhenConsumerStopsReading(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	id, err := store.Create(context.Background(), "topic", twoParticipants())
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	dialer := &fakeDialer{scripts: map[string]string{"critic": "a", "pragmatist": "b"}}
+	mod := NewModerator(store, dialer, testLogger(), 3)
+
+	out := make(chan Event) // unbuffered, and nothing ever reads from it
+	done := make(chan error, 1)
+	go func() { done <- mod.Run(ctx, id, "x", 2, out) }()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("Run returned nil error after ctx cancellation, want ctx.Err()")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx was canceled — goroutine leaked (regression)")
 	}
 }

@@ -50,7 +50,8 @@ func NewModerator(store *Store, dialer agentDialer, log *slog.Logger, maxRounds 
 // itself reporting TaskStateFailed) does not abort the meeting — it emits a
 // speaker_error event and the loop moves on to the next participant. Run
 // only returns an error when the meeting cannot proceed at all (not found,
-// no participants, or the human's own turn failed to save).
+// no participants, the human's own turn failed to save, or the client
+// disconnected — see sendEvent).
 func (m *Moderator) Run(ctx context.Context, meetingID uuid.UUID, utterance string, rounds int, out chan<- Event) error {
 	if rounds < 1 {
 		rounds = 1
@@ -80,28 +81,51 @@ func (m *Moderator) Run(ctx context.Context, meetingID uuid.UUID, utterance stri
 
 	for round := 1; round <= rounds; round++ {
 		for _, p := range mtg.Participants {
-			out <- Event{Type: "speaker_start", Round: round, PersonaSlug: p.Slug, PersonaName: p.Name}
-			m.runOneTurn(ctx, meetingID, round, p, names, utterance, out)
+			if !sendEvent(ctx, out, Event{Type: "speaker_start", Round: round, PersonaSlug: p.Slug, PersonaName: p.Name}) {
+				return ctx.Err()
+			}
+			if !m.runOneTurn(ctx, meetingID, round, p, names, utterance, out) {
+				return ctx.Err()
+			}
 		}
-		out <- Event{Type: "round_end", Round: round}
+		if !sendEvent(ctx, out, Event{Type: "round_end", Round: round}) {
+			return ctx.Err()
+		}
 	}
 
-	out <- Event{Type: "done"}
+	sendEvent(ctx, out, Event{Type: "done"})
 	return nil
+}
+
+// sendEvent sends ev on out, but bails out via ctx instead of blocking
+// forever if the consumer has stopped reading (e.g. the browser's SSE
+// connection dropped and internal/api/turns.go's handler returned) and the
+// buffered channel is full. A plain `out <- ev` here would leak this
+// goroutine (and the A2A connections and DB handles it holds) for as long
+// as the moderator process runs — ctx cancellation only unblocks operations
+// that explicitly check it, never a channel send already parked on a full
+// buffer. Caught by code review, not by any existing test.
+func sendEvent(ctx context.Context, out chan<- Event, ev Event) bool {
+	select {
+	case out <- ev:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // runOneTurn drives one participant's A2A call for one round, translating
 // its streamed events into meeting.Events. Any failure here is reported as
 // speaker_error and swallowed — see Run's doc comment on partial-failure
-// semantics.
-func (m *Moderator) runOneTurn(ctx context.Context, meetingID uuid.UUID, round int, p Participant, participants []string, utterance string, out chan<- Event) {
+// semantics. The bool return is false only when ctx died mid-send (the
+// caller should stop the whole meeting then, not just this participant).
+func (m *Moderator) runOneTurn(ctx context.Context, meetingID uuid.UUID, round int, p Participant, participants []string, utterance string, out chan<- Event) bool {
 	// Re-read on every participant, not once per round: this is what lets a
 	// later participant in the same round see an earlier one's statement —
 	// see Run's doc comment.
 	transcript, err := m.store.Transcript(ctx, meetingID)
 	if err != nil {
-		m.speakerError(out, p, fmt.Sprintf("load transcript: %v", err))
-		return
+		return m.speakerError(ctx, out, p, fmt.Sprintf("load transcript: %v", err))
 	}
 
 	payload := a2aconv.TranscriptPayload{
@@ -114,8 +138,7 @@ func (m *Moderator) runOneTurn(ctx context.Context, meetingID uuid.UUID, round i
 
 	client, err := m.dialer.Dial(ctx, p)
 	if err != nil {
-		m.speakerError(out, p, fmt.Sprintf("dial: %v", err))
-		return
+		return m.speakerError(ctx, out, p, fmt.Sprintf("dial: %v", err))
 	}
 
 	var sb strings.Builder
@@ -125,8 +148,7 @@ func (m *Moderator) runOneTurn(ctx context.Context, meetingID uuid.UUID, round i
 
 	for ev, err := range client.SendStreamingMessage(ctx, &a2a.SendMessageRequest{Message: msg}) {
 		if err != nil {
-			m.speakerError(out, p, fmt.Sprintf("stream: %v", err))
-			return
+			return m.speakerError(ctx, out, p, fmt.Sprintf("stream: %v", err))
 		}
 		switch e := ev.(type) {
 		case *a2a.TaskArtifactUpdateEvent:
@@ -136,12 +158,16 @@ func (m *Moderator) runOneTurn(ctx context.Context, meetingID uuid.UUID, round i
 			for _, part := range e.Artifact.Parts {
 				if payload, ok, cerr := a2aconv.CitationsFrom(part); cerr == nil && ok {
 					citations = payload.Citations
-					out <- Event{Type: "sources", PersonaSlug: p.Slug, Citations: toCitations(citations)}
+					if !sendEvent(ctx, out, Event{Type: "sources", PersonaSlug: p.Slug, Citations: toCitations(citations)}) {
+						return false
+					}
 					continue
 				}
 				if text := part.Text(); text != "" {
 					sb.WriteString(text)
-					out <- Event{Type: "token", PersonaSlug: p.Slug, Text: text}
+					if !sendEvent(ctx, out, Event{Type: "token", PersonaSlug: p.Slug, Text: text}) {
+						return false
+					}
 				}
 			}
 		case *a2a.TaskStatusUpdateEvent:
@@ -160,7 +186,9 @@ func (m *Moderator) runOneTurn(ctx context.Context, meetingID uuid.UUID, round i
 			for _, part := range e.Parts {
 				if text := part.Text(); text != "" {
 					sb.WriteString(text)
-					out <- Event{Type: "token", PersonaSlug: p.Slug, Text: text}
+					if !sendEvent(ctx, out, Event{Type: "token", PersonaSlug: p.Slug, Text: text}) {
+						return false
+					}
 				}
 			}
 		}
@@ -170,8 +198,7 @@ func (m *Moderator) runOneTurn(ctx context.Context, meetingID uuid.UUID, round i
 		if failMsg == "" {
 			failMsg = "persona reported a failure"
 		}
-		m.speakerError(out, p, failMsg)
-		return
+		return m.speakerError(ctx, out, p, failMsg)
 	}
 
 	saveCtx := context.WithoutCancel(ctx)
@@ -179,8 +206,7 @@ func (m *Moderator) runOneTurn(ctx context.Context, meetingID uuid.UUID, round i
 		Round: round, Role: "persona", SpeakerSlug: p.Slug, SpeakerName: p.Name, Content: sb.String(),
 	})
 	if err != nil {
-		m.speakerError(out, p, fmt.Sprintf("save turn: %v", err))
-		return
+		return m.speakerError(ctx, out, p, fmt.Sprintf("save turn: %v", err))
 	}
 	if len(citations) > 0 {
 		if err := m.store.SaveCitations(saveCtx, turn.ID, toCitations(citations)); err != nil {
@@ -191,12 +217,12 @@ func (m *Moderator) runOneTurn(ctx context.Context, meetingID uuid.UUID, round i
 		}
 	}
 	turn.Citations = toCitations(citations)
-	out <- Event{Type: "speaker_end", PersonaSlug: p.Slug, PersonaName: p.Name, Turn: &turn}
+	return sendEvent(ctx, out, Event{Type: "speaker_end", PersonaSlug: p.Slug, PersonaName: p.Name, Turn: &turn})
 }
 
-func (m *Moderator) speakerError(out chan<- Event, p Participant, msg string) {
+func (m *Moderator) speakerError(ctx context.Context, out chan<- Event, p Participant, msg string) bool {
 	m.log.Warn("speaker failed", "persona_slug", p.Slug, "error", msg)
-	out <- Event{Type: "speaker_error", PersonaSlug: p.Slug, PersonaName: p.Name, Error: msg}
+	return sendEvent(ctx, out, Event{Type: "speaker_error", PersonaSlug: p.Slug, PersonaName: p.Name, Error: msg})
 }
 
 func participantNames(ps []Participant) []string {
@@ -210,8 +236,7 @@ func participantNames(ps []Participant) []string {
 func toWire(turns []Turn) []a2aconv.TurnWire {
 	out := make([]a2aconv.TurnWire, len(turns))
 	for i, t := range turns {
-		speaker := t.SpeakerName
-		out[i] = a2aconv.TurnWire{Role: t.Role, SpeakerName: speaker, Content: t.Content}
+		out[i] = a2aconv.TurnWire{Role: t.Role, SpeakerSlug: t.SpeakerSlug, SpeakerName: t.SpeakerName, Content: t.Content}
 	}
 	return out
 }

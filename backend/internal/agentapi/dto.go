@@ -1,29 +1,14 @@
 package agentapi
 
-import (
-	"github.com/a2aproject/a2a-go/v2/a2a"
+import "github.com/shun/kaigi/backend/internal/registry"
 
-	"github.com/shun/kaigi/backend/internal/registry"
-)
-
-type skillDTO struct {
-	ID   string   `json:"id"`
-	Name string   `json:"name"`
-	Tags []string `json:"tags"`
-}
-
-type agentDTO struct {
-	Slug      string         `json:"slug"`
-	Name      string         `json:"name"`
-	PersonaID string         `json:"personaId"`
-	BaseURL   string         `json:"baseUrl"`
-	Present   bool           `json:"present"`
-	Skills    []skillDTO     `json:"skills"`
-	Card      *a2a.AgentCard `json:"card"`
-}
-
-func toAgentDTO(a registry.Agent, present bool) agentDTO {
-	dto := agentDTO{
+// toAgentDTO reuses registry.AgentDTO directly rather than keeping a second,
+// locally-defined shape — the two used to drift (this package's own
+// skillDTO/agentDTO had no Skills-carrying counterpart on the client side,
+// silently dropping skills data before it reached the frontend; see the
+// code review finding this fixes).
+func toAgentDTO(a registry.Agent, present bool) registry.AgentDTO {
+	dto := registry.AgentDTO{
 		Slug:      a.Slug,
 		PersonaID: a.PersonaID.String(),
 		BaseURL:   a.BaseURL,
@@ -32,9 +17,9 @@ func toAgentDTO(a registry.Agent, present bool) agentDTO {
 	}
 	if a.Card != nil {
 		dto.Name = a.Card.Name
-		dto.Skills = make([]skillDTO, len(a.Card.Skills))
+		dto.Skills = make([]registry.Skill, len(a.Card.Skills))
 		for i, s := range a.Card.Skills {
-			dto.Skills[i] = skillDTO{ID: s.ID, Name: s.Name, Tags: s.Tags}
+			dto.Skills[i] = registry.Skill{ID: s.ID, Name: s.Name, Tags: s.Tags}
 		}
 	}
 	return dto

@@ -146,7 +146,7 @@ func (h *handlers) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	dtos := make([]agentDTO, len(agents))
+	dtos := make([]registry.AgentDTO, len(agents))
 	for i, a := range agents {
 		dtos[i] = toAgentDTO(a, a.Present(now, h.deps.TTL))
 	}

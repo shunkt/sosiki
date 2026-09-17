@@ -131,7 +131,7 @@ func (e *Executor) Cancel(_ context.Context, execCtx *a2asrv.ExecutorContext) it
 func toTurns(wires []a2aconv.TurnWire) []chat.Turn {
 	out := make([]chat.Turn, len(wires))
 	for i, w := range wires {
-		out[i] = chat.Turn{Role: w.Role, SpeakerName: w.SpeakerName, Content: w.Content}
+		out[i] = chat.Turn{Role: w.Role, SpeakerSlug: w.SpeakerSlug, SpeakerName: w.SpeakerName, Content: w.Content}
 	}
 	return out
 }
@@ -143,6 +143,7 @@ func toCitationWires(sources []chat.Source) []a2aconv.CitationWire {
 			ChunkID:    s.ChunkID.String(),
 			DocumentID: s.DocumentID.String(),
 			Title:      s.Title,
+			ObjectKey:  s.ObjectKey,
 			URL:        s.URL,
 			Relevance:  s.Relevance,
 			Affinity:   s.Affinity,

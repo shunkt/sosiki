@@ -18,7 +18,14 @@ type Source struct {
 	ChunkID    uuid.UUID `json:"chunkId"`
 	DocumentID uuid.UUID `json:"documentId"`
 	Title      string    `json:"title"`
-	URL        string    `json:"url"`
-	Relevance  float32   `json:"relevance"`
-	Affinity   float32   `json:"affinity"`
+	// ObjectKey is the chunk's MinIO object key, carried alongside the
+	// already-presigned URL so a caller that persists this Source (see
+	// personaexec.toCitationWires -> meeting.Citation.ObjectKey) can still
+	// identify the underlying object after URL has expired. Without this,
+	// every persisted citation's object_key column was silently empty — see
+	// the code review finding this fixes.
+	ObjectKey string  `json:"objectKey"`
+	URL       string  `json:"url"`
+	Relevance float32 `json:"relevance"`
+	Affinity  float32 `json:"affinity"`
 }

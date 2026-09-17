@@ -5,18 +5,14 @@ package main
 
 import (
 	"context"
-	"errors"
 	"log/slog"
-	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
 
 	"github.com/shun/kaigi/backend/internal/agentapi"
 	"github.com/shun/kaigi/backend/internal/config"
 	"github.com/shun/kaigi/backend/internal/db"
 	"github.com/shun/kaigi/backend/internal/registry"
+	"github.com/shun/kaigi/backend/internal/serve"
 )
 
 func main() {
@@ -33,8 +29,15 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	// discovery has no OpenAI key and no retrieval tuning to validate —
-	// cfg.Validate() is for the persona pod and seed only. Its own
-	// requirement is just a database to connect to, checked by db.New below.
+	// cfg.Validate() is for the persona pod and seed only. It does compute
+	// agent presence from cfg.Registry.TTL/HeartbeatInterval at request
+	// time, though, so cfg.ValidateRegistry() still applies here (not just
+	// to cmd/persona, which self-registers on that same interval) — without
+	// it, a misconfigured TTL boots successfully and silently serves wrong
+	// presence data instead of failing fast.
+	if err := cfg.ValidateRegistry(); err != nil {
+		return err
+	}
 
 	ctx := context.Background()
 
@@ -52,32 +55,5 @@ func run(log *slog.Logger) error {
 		TTL:      cfg.Registry.TTL,
 	})
 
-	srv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-
-	errCh := make(chan error, 1)
-	go func() {
-		log.Info("listening", "addr", cfg.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-		}
-	}()
-
-	stopCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	select {
-	case err := <-errCh:
-		return err
-	case <-stopCtx.Done():
-		log.Info("shutting down")
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	return serve.Run(ctx, log, cfg.Addr, handler)
 }

@@ -43,7 +43,13 @@ const (
 // contract, and the domain types on either side of it are free to evolve
 // independently of it.
 type TurnWire struct {
-	Role        string `json:"role"` // "user" | "persona"
+	Role string `json:"role"` // "user" | "persona"
+	// SpeakerSlug is "" for the human's own turns and is what a receiving
+	// persona uses to tell its own prior statements apart from another
+	// persona's (see chat/engine.go's toChatMessages/Reply) — SpeakerName
+	// alone is not safe for that: personas.slug is UNIQUE but personas.name
+	// is not, so two personas could share a display name.
+	SpeakerSlug string `json:"speakerSlug"`
 	SpeakerName string `json:"speakerName"`
 	Content     string `json:"content"`
 }
