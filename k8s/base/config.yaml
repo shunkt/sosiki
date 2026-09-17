@@ -1,0 +1,29 @@
+# Non-secret configuration shared across services. Each Deployment picks the
+# subset it needs via envFrom — an unused key in a given pod is harmless.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kaigi-config
+  namespace: kaigi
+data:
+  POSTGRES_BASE_URL: "postgres://postgres:kaigi@postgres:5432?sslmode=disable"
+  MINIO_ENDPOINT: "minio:9000"
+  # Overridden in overlays/local to a browser-reachable host — see that
+  # overlay's kustomization.yaml and the plan's GOTCHA on this exact value.
+  MINIO_PUBLIC_ENDPOINT: "minio:9000"
+  MINIO_BUCKET: "kaigi-knowledge"
+  MINIO_REGION: "us-east-1"
+  MINIO_USE_SSL: "false"
+  REGISTRY_URL: "http://discovery:8081"
+  REGISTRY_HEARTBEAT_INTERVAL: "15s"
+  REGISTRY_TTL: "45s"
+  CHAT_MODEL: "gpt-5-mini"
+  EMBED_MODEL: "text-embedding-3-small"
+  CANDIDATE_K: "40"
+  FINAL_N: "8"
+  PERSONA_INFLUENCE: "0.25"
+  CONTEXT_PAD_BYTES: "1200"
+  RELEVANCE_FLOOR: "0.25"
+  RELEVANCE_SKEPTICISM_SPAN: "0.20"
+  MEETING_MAX_ROUNDS: "3"
+  ALLOWED_ORIGINS: "http://localhost:5173"

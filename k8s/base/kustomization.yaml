@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kaigi
+
+resources:
+  - namespace.yaml
+  - config.yaml
+  - secret.yaml
+  - postgres.yaml
+  - minio.yaml
+  - minio-init-job.yaml
+  - discovery.yaml
+  - personas/persona-critic.yaml
+  - personas/persona-pragmatist.yaml
+  - frontend.yaml
+  - ingress.yaml
+  # seed-job.yaml is intentionally NOT listed here — see its own header
+  # comment. Apply it explicitly (`make k8s-seed`) after the stack is up.

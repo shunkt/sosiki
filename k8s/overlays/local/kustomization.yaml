@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Not re-declared here: base/kustomization.yaml already namespaces every
+# resource into kaigi.
+
+resources:
+  - ../../base
+
+patches:
+  - path: imagepullpolicy-patch.yaml
+  - path: minio-nodeport-patch.yaml
+  - path: configmap-patch.yaml
+  # Gitignored — copy secret-patch.yaml.example to secret-patch.yaml and
+  # fill in a real OPENAI_API_KEY before `kubectl apply -k` (make k8s-up
+  # checks for this file and fails with a clear message if it's missing).
+  - path: secret-patch.yaml
+
+images:
+  - name: kaigi-backend
+    newTag: local
+  - name: kaigi-frontend
+    newTag: local

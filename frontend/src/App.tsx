@@ -1,34 +1,40 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  createConversation,
+  createMeeting,
   getHealth,
-  listPersonas,
-  sendMessage,
-  type Message,
-  type Persona,
-  type Source,
+  listAgents,
+  sendTurn,
+  type Agent,
+  type Turn,
 } from './api/client'
 import './App.css'
 
 type Status = 'checking' | 'ok' | 'degraded' | 'unreachable'
 
-// DisplayMessage extends the persisted Message shape with per-turn UI state
-// (sources arrive as a separate SSE event, before the message itself is
-// saved) so a single list can render both historical and in-flight turns.
-type DisplayMessage = Message & { sources?: Source[] }
+// DisplayTurn extends the persisted Turn shape with in-flight streaming
+// state (a turn only exists server-side once speaker_end arrives; until
+// then this is a placeholder the UI fills in token by token).
+type DisplayTurn = Turn & { pending?: boolean; failed?: boolean }
+
+// RoundMarker is a synthetic list entry — not a Turn — used to render the
+// "── Round N ──" separators between rounds without threading round
+// boundaries through Turn itself.
+type ListItem = { kind: 'turn'; turn: DisplayTurn } | { kind: 'round'; round: number }
 
 function App() {
   const [status, setStatus] = useState<Status>('checking')
-  const [personas, setPersonas] = useState<Persona[]>([])
-  const [personaId, setPersonaId] = useState<string>('')
-  const [conversationId, setConversationId] = useState<string>('')
-  const [messages, setMessages] = useState<DisplayMessage[]>([])
+  const [agents, setAgents] = useState<Agent[]>([])
+  const [selectedSlugs, setSelectedSlugs] = useState<Set<string>>(new Set())
+  const [rounds, setRounds] = useState(2)
+  const [meetingId, setMeetingId] = useState<string>('')
+  const [items, setItems] = useState<ListItem[]>([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  const [activeSpeakerSlug, setActiveSpeakerSlug] = useState<string>('')
   const [error, setError] = useState('')
 
-  // Guards against React 19 StrictMode's double-invoked effects starting two
-  // overlapping streams, and lets a persona switch cancel an in-flight reply.
+  // Guards against React 19 StrictMode's double-invoked effects, and lets a
+  // still-streaming turn be canceled if the component unmounts.
   const abortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
@@ -38,89 +44,150 @@ function App() {
       .catch(() => {
         if (!controller.signal.aborted) setStatus('unreachable')
       })
-    listPersonas(controller.signal)
-      .then((list) => {
-        setPersonas(list)
-        if (list.length > 0) setPersonaId(list[0].id)
-      })
+    listAgents(controller.signal)
+      .then((list) => setAgents(list))
       .catch(() => {
         if (!controller.signal.aborted) setError('ペルソナの取得に失敗しました')
       })
     return () => controller.abort()
   }, [])
 
-  // Selecting a persona starts a fresh conversation — cancel any reply still
-  // streaming for the previous one first.
-  useEffect(() => {
-    abortRef.current?.abort()
-    setConversationId('')
-    setMessages([])
-    if (!personaId) return
+  function toggleSlug(slug: string) {
+    setSelectedSlugs((prev) => {
+      const next = new Set(prev)
+      if (next.has(slug)) next.delete(slug)
+      else next.add(slug)
+      return next
+    })
+  }
 
-    const controller = new AbortController()
-    createConversation(personaId, '', controller.signal)
-      .then((conv) => {
-        if (!controller.signal.aborted) setConversationId(conv.id)
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) setError('会話の作成に失敗しました')
-      })
-    return () => controller.abort()
-  }, [personaId])
-
-  async function handleSend() {
+  // Starting a meeting is a deliberate user action (the button below), never
+  // an effect — creating it as a side effect of participant selection would
+  // double-fire under React 19 StrictMode's double-invoked effects, exactly
+  // the trap the pre-meeting single-persona version's own comment warned
+  // about for its analogous "selecting a persona starts a conversation" effect.
+  async function handleStart() {
     const content = input.trim()
-    if (!content || !conversationId || sending) return
+    const slugs = [...selectedSlugs]
+    if (slugs.length === 0 || !content || sending) return
 
+    setError('')
+    setSending(true)
+    try {
+      // The meeting's topic is the human's opening message itself — there
+      // is no separate topic field, matching the plan's UX Design where a
+      // single input serves both purposes.
+      const meeting = await createMeeting(content, slugs)
+      setMeetingId(meeting.id)
+      setItems([])
+      setInput('')
+      await runTurn(meeting.id, content, rounds)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setSending(false)
+    }
+  }
+
+  async function handleContinue() {
+    const content = input.trim()
+    if (!content || !meetingId || sending) return
     setInput('')
     setError('')
     setSending(true)
-    setMessages((prev) => [
-      ...prev,
-      { id: `pending-user-${Date.now()}`, role: 'user', content, createdAt: '' },
-    ])
+    await runTurn(meetingId, content, rounds)
+  }
 
+  async function runTurn(id: string, content: string, roundCount: number) {
     const controller = new AbortController()
     abortRef.current = controller
 
-    // The assistant turn accumulates token-by-token into the same list entry
-    // rather than as a separate buffer, so streaming and history rendering
-    // share one code path.
-    let assistantIndex = -1
-    setMessages((prev) => {
-      assistantIndex = prev.length
-      return [...prev, { id: `pending-assistant-${Date.now()}`, role: 'assistant', content: '', createdAt: '' }]
-    })
+    // currentIndex tracks the in-flight turn's position in items so token
+    // events can append without a full re-scan — same pattern the
+    // single-persona version used for its one assistant slot, generalized
+    // to whichever speaker is currently active.
+    let currentIndex = -1
 
     try {
-      for await (const event of sendMessage(conversationId, content, controller.signal)) {
+      for await (const event of sendTurn(id, content, roundCount, controller.signal)) {
         switch (event.type) {
-          case 'sources':
-            setMessages((prev) => {
-              const next = [...prev]
-              next[assistantIndex] = { ...next[assistantIndex], sources: event.sources }
-              return next
+          case 'speaker_start':
+            setActiveSpeakerSlug(event.personaSlug)
+            setItems((prev) => {
+              currentIndex = prev.length
+              return [
+                ...prev,
+                {
+                  kind: 'turn',
+                  turn: {
+                    id: `pending-${event.personaSlug}-${Date.now()}`,
+                    seq: -1,
+                    round: event.round,
+                    role: 'persona',
+                    speakerSlug: event.personaSlug,
+                    speakerName: event.personaName,
+                    content: '',
+                    createdAt: '',
+                    pending: true,
+                  },
+                },
+              ]
             })
             break
-          case 'token':
-            setMessages((prev) => {
+          case 'sources':
+            setItems((prev) => {
               const next = [...prev]
-              next[assistantIndex] = {
-                ...next[assistantIndex],
-                content: next[assistantIndex].content + event.text,
+              const item = next[currentIndex]
+              if (item?.kind === 'turn') {
+                next[currentIndex] = { kind: 'turn', turn: { ...item.turn, citations: event.citations } }
               }
               return next
             })
             break
-          case 'done':
-            setMessages((prev) => {
+          case 'token':
+            setItems((prev) => {
               const next = [...prev]
-              next[assistantIndex] = { ...event.message, sources: next[assistantIndex].sources }
+              const item = next[currentIndex]
+              if (item?.kind === 'turn') {
+                next[currentIndex] = {
+                  kind: 'turn',
+                  turn: { ...item.turn, content: item.turn.content + event.text },
+                }
+              }
               return next
             })
             break
+          case 'speaker_end':
+            setItems((prev) => {
+              const next = [...prev]
+              const item = next[currentIndex]
+              if (item?.kind === 'turn') {
+                next[currentIndex] = { kind: 'turn', turn: { ...event.turn, citations: item.turn.citations } }
+              }
+              return next
+            })
+            setActiveSpeakerSlug('')
+            break
+          case 'speaker_error':
+            setItems((prev) => {
+              const next = [...prev]
+              const item = next[currentIndex]
+              if (item?.kind === 'turn') {
+                next[currentIndex] = {
+                  kind: 'turn',
+                  turn: { ...item.turn, pending: false, failed: true, content: event.error },
+                }
+              }
+              return next
+            })
+            setActiveSpeakerSlug('')
+            break
+          case 'round_end':
+            setItems((prev) => [...prev, { kind: 'round', round: event.round + 1 }])
+            break
           case 'error':
             setError(event.error)
+            break
+          case 'done':
             break
         }
       }
@@ -130,61 +197,95 @@ function App() {
       }
     } finally {
       setSending(false)
+      setActiveSpeakerSlug('')
     }
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      void handleSend()
+      void (meetingId ? handleContinue() : handleStart())
     }
   }
 
-  const selectedPersona = personas.find((p) => p.id === personaId)
+  const presentCount = agents.filter((a) => a.present).length
 
   return (
     <main className="app">
       <header className="app-header">
-        <h1>kaigi</h1>
+        <h1>kaigi 会議</h1>
         <span className={`status status--${status}`}>backend: {status}</span>
-        <select
-          className="persona-select"
-          value={personaId}
-          onChange={(e) => setPersonaId(e.target.value)}
-          disabled={personas.length === 0}
-        >
-          {personas.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
+        <span className="presence">
+          ● {presentCount}/{agents.length} 在席
+        </span>
       </header>
 
-      {selectedPersona && <p className="persona-stance">{selectedPersona.stance}</p>}
+      {!meetingId && (
+        <section className="setup">
+          <div className="participants">
+            {agents.map((a) => (
+              <label key={a.slug} className={`participant-chip ${a.present ? '' : 'participant-chip--absent'}`}>
+                <input
+                  type="checkbox"
+                  checked={selectedSlugs.has(a.slug)}
+                  disabled={!a.present}
+                  onChange={() => toggleSlug(a.slug)}
+                />
+                {a.name}
+                {!a.present && <span className="absent-badge">不在</span>}
+              </label>
+            ))}
+          </div>
+          <label className="rounds-select">
+            ラウンド:
+            <select value={rounds} onChange={(e) => setRounds(Number(e.target.value))}>
+              {[1, 2, 3].map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </label>
+        </section>
+      )}
 
       <section className="messages">
-        {messages.map((m) => (
-          <div key={m.id} className={`message message--${m.role}`}>
-            <span className="message-role">{m.role === 'user' ? 'user' : selectedPersona?.name ?? 'assistant'}</span>
-            <p className="message-content">{m.content || (sending && m.role === 'assistant' ? '…' : '')}</p>
-            {m.sources && m.sources.length > 0 && (
-              <ol className="sources">
-                {m.sources.map((s) => (
-                  <li key={s.chunkId}>
-                    <a href={s.url} target="_blank" rel="noreferrer">
-                      {s.title}
-                    </a>
-                    <span className="source-scores">
-                      関連 {s.relevance.toFixed(2)} / 関心 {s.affinity >= 0 ? '+' : ''}
-                      {s.affinity.toFixed(2)}
-                    </span>
-                  </li>
-                ))}
-              </ol>
-            )}
-          </div>
-        ))}
+        {items.map((item, i) =>
+          item.kind === 'round' ? (
+            <div key={`round-${item.round}-${i}`} className="round-marker">
+              <hr />
+              <span>Round {item.round}</span>
+              <hr />
+            </div>
+          ) : (
+            <div
+              key={item.turn.id}
+              className={`message message--${item.turn.role} ${item.turn.failed ? 'message--failed' : ''} ${
+                activeSpeakerSlug === item.turn.speakerSlug && item.turn.pending ? 'message--active' : ''
+              }`}
+            >
+              <span className="message-role">{item.turn.role === 'user' ? 'user' : item.turn.speakerName}</span>
+              <p className="message-content">
+                {item.turn.content || (item.turn.pending ? '…' : '')}
+              </p>
+              {item.turn.citations && item.turn.citations.length > 0 && (
+                <ol className="sources">
+                  {item.turn.citations.map((c) => (
+                    <li key={c.chunkId}>
+                      <a href={c.url} target="_blank" rel="noreferrer">
+                        {c.title}
+                      </a>
+                      <span className="source-scores">
+                        関連 {c.relevance.toFixed(2)} / 関心 {c.affinity >= 0 ? '+' : ''}
+                        {c.affinity.toFixed(2)}
+                      </span>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          ),
+        )}
       </section>
 
       {error && <p className="error">{error}</p>}
@@ -194,11 +295,15 @@ function App() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="メッセージを入力…"
-          disabled={!conversationId || sending}
+          placeholder={meetingId ? 'メッセージを入力…' : '議題を入力…'}
+          disabled={sending || (!meetingId && selectedSlugs.size === 0)}
         />
-        <button type="button" onClick={() => void handleSend()} disabled={!conversationId || sending || !input.trim()}>
-          送信
+        <button
+          type="button"
+          onClick={() => void (meetingId ? handleContinue() : handleStart())}
+          disabled={sending || !input.trim() || (!meetingId && selectedSlugs.size === 0)}
+        >
+          {meetingId ? '送信' : '開始'}
         </button>
       </div>
     </main>

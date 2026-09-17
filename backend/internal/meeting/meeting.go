@@ -12,11 +12,20 @@ import (
 )
 
 // Participant is one persona seated at a meeting, in the order it speaks.
+//
+// JSON tags matter here even though internal/api has its own DTO layer for
+// the REST endpoints: meeting.Event (below) is marshaled directly for the
+// SSE stream, with no DTO in between, so Turn/Citation's own tags are what
+// the frontend actually receives from speaker_end/sources frames. Without
+// them the field names would default to Go's PascalCase and silently
+// mismatch the REST API's camelCase — a real inconsistency caught by
+// inspecting an actual captured SSE stream, not by any test (nothing
+// asserts on exact JSON key casing).
 type Participant struct {
-	Slug          string
-	Name          string
-	BaseURL       string
-	SpeakingOrder int
+	Slug          string `json:"slug"`
+	Name          string `json:"name"`
+	BaseURL       string `json:"baseUrl"`
+	SpeakingOrder int    `json:"speakingOrder"`
 }
 
 // Citation is one piece of retrieved evidence behind a persona's turn. It
@@ -24,35 +33,35 @@ type Participant struct {
 // comment for why — so every field the client needs to render a citation is
 // copied here directly rather than joined at read time.
 type Citation struct {
-	ChunkID    uuid.UUID
-	DocumentID uuid.UUID
-	Rank       int
-	Title      string
-	ObjectKey  string
-	URL        string
-	Relevance  float32
-	Affinity   float32
+	ChunkID    uuid.UUID `json:"chunkId"`
+	DocumentID uuid.UUID `json:"documentId"`
+	Rank       int       `json:"rank"`
+	Title      string    `json:"title"`
+	ObjectKey  string    `json:"objectKey"`
+	URL        string    `json:"url"`
+	Relevance  float32   `json:"relevance"`
+	Affinity   float32   `json:"affinity"`
 }
 
 // Turn is one statement in the meeting: the human's opening topic (Round 0,
 // SpeakerSlug empty) or one persona's reply in a later round.
 type Turn struct {
-	ID          uuid.UUID
-	Seq         int
-	Round       int
-	Role        string // "user" | "persona"
-	SpeakerSlug string // "" for the human
-	SpeakerName string
-	Content     string
-	Citations   []Citation
-	CreatedAt   time.Time
+	ID          uuid.UUID  `json:"id"`
+	Seq         int        `json:"seq"`
+	Round       int        `json:"round"`
+	Role        string     `json:"role"`        // "user" | "persona"
+	SpeakerSlug string     `json:"speakerSlug"` // "" for the human
+	SpeakerName string     `json:"speakerName"`
+	Content     string     `json:"content"`
+	Citations   []Citation `json:"citations,omitempty"`
+	CreatedAt   time.Time  `json:"createdAt"`
 }
 
 type Meeting struct {
-	ID           uuid.UUID
-	Topic        string
-	Participants []Participant
-	Turns        []Turn
+	ID           uuid.UUID     `json:"id"`
+	Topic        string        `json:"topic"`
+	Participants []Participant `json:"participants"`
+	Turns        []Turn        `json:"turns"`
 }
 
 // Event is one unit of progress the HTTP layer turns into an SSE frame.

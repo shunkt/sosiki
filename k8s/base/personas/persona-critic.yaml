@@ -1,0 +1,71 @@
+# To add a third persona: copy this file, then change exactly these four
+# things — metadata.name/labels.app/selector.matchLabels.app (all the same
+# "persona-<slug>" string), PERSONA_SLUG, A2A_PUBLIC_URL's host, and the
+# Service's own name/selector to match. The slug must have a matching row in
+# kaigi_persona — see backend/cmd/seed/main.go's CreateInput list — or the
+# pod refuses to start (persona.Store.GetBySlug / cmd/persona's boot check).
+# Then add this file to kustomization.yaml's resources.
+apiVersion: v1
+kind: Service
+metadata:
+  name: persona-critic
+  namespace: kaigi
+spec:
+  selector:
+    app: persona-critic
+  ports:
+    - port: 8082
+      targetPort: 8082
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: persona-critic
+  namespace: kaigi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: persona-critic
+  template:
+    metadata:
+      labels:
+        app: persona-critic
+    spec:
+      containers:
+        - name: persona
+          image: kaigi-backend
+          command: ["/app/persona"]
+          envFrom:
+            - configMapRef:
+                name: kaigi-config
+            - secretRef:
+                name: kaigi-secrets
+          env:
+            - name: ADDR
+              value: ":8082"
+            - name: PERSONA_SLUG
+              value: "critic"
+            # This pod's OWN address as seen by OTHER pods (discovery
+            # resolving its card, moderator dialing it) — a Service FQDN,
+            # never "localhost". See the plan's GOTCHA on this exact value.
+            - name: A2A_PUBLIC_URL
+              value: "http://persona-critic.kaigi.svc.cluster.local:8082"
+          ports:
+            - containerPort: 8082
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8082
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi

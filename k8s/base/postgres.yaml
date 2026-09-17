@@ -1,0 +1,89 @@
+# initdb runs once, only against an empty PVC — see postgres-init's own
+# comment and the plan's GOTCHA: a PVC from before this topology existed
+# will not get these databases created, and every service fails to boot
+# with "database does not exist". Fix: delete the PVC and let this
+# StatefulSet recreate it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-initdb
+  namespace: kaigi
+data:
+  001-create-databases.sql: |
+    CREATE DATABASE kaigi_meeting;
+    CREATE DATABASE kaigi_registry;
+    CREATE DATABASE kaigi_persona;
+    CREATE DATABASE kaigi_knowledge;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: kaigi
+spec:
+  # Headless: StatefulSet pods are addressed individually, but a single
+  # replica means postgres.kaigi.svc.cluster.local (or just "postgres"
+  # in-namespace) is all any client needs.
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: kaigi
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg17
+          env:
+            - name: POSTGRES_PASSWORD
+              value: "kaigi"
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+      volumes:
+        - name: initdb
+          configMap:
+            name: postgres-initdb
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

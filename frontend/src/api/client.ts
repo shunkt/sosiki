@@ -1,20 +1,15 @@
-export type Health = { status: string; embed?: string; rerank?: string }
+export type Health = { status: string; db?: string }
 
-export type Interest = { topic: string; weight: number }
-export type Verbosity = 'concise' | 'balanced' | 'detailed'
-export type Persona = {
-  id: string
+export type Skill = { id: string; name: string; tags: string[] }
+export type Agent = {
+  slug: string
   name: string
-  stance: string
-  verbosity: Verbosity
-  skepticism: number
-  interests: Interest[]
+  personaId: string
+  present: boolean
+  skills: Skill[]
 }
 
-export type Message = { id: string; role: 'user' | 'assistant'; content: string; createdAt: string }
-export type Conversation = { id: string; personaId: string; title: string; messages: Message[] }
-
-export type Source = {
+export type Citation = {
   chunkId: string
   documentId: string
   title: string
@@ -23,10 +18,33 @@ export type Source = {
   affinity: number
 }
 
-export type ChatEvent =
-  | { type: 'token'; text: string }
-  | { type: 'sources'; sources: Source[] }
-  | { type: 'done'; message: Message }
+export type Turn = {
+  id: string
+  seq: number
+  round: number
+  role: 'user' | 'persona'
+  speakerSlug: string
+  speakerName: string
+  content: string
+  citations?: Citation[]
+  createdAt: string
+}
+
+export type Participant = { slug: string; name: string; speakingOrder: number }
+export type Meeting = { id: string; topic: string; participants: Participant[]; turns: Turn[] }
+
+// MeetingEvent mirrors meeting.Event's JSON shape (backend/internal/meeting/meeting.go).
+// personaSlug/personaName identify which participant an event is about — a
+// meeting has many speakers, unlike the single-persona chat.Event this
+// replaced.
+export type MeetingEvent =
+  | { type: 'speaker_start'; round: number; personaSlug: string; personaName: string }
+  | { type: 'sources'; personaSlug: string; citations: Citation[] }
+  | { type: 'token'; personaSlug: string; text: string }
+  | { type: 'speaker_end'; personaSlug: string; personaName: string; turn: Turn }
+  | { type: 'speaker_error'; personaSlug: string; personaName: string; error: string }
+  | { type: 'round_end'; round: number }
+  | { type: 'done' }
   | { type: 'error'; error: string }
 
 async function getJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
@@ -45,40 +63,44 @@ async function postJSON<T>(path: string, body: unknown, signal?: AbortSignal): P
     body: JSON.stringify(body),
   })
   if (!res.ok) {
-    throw new Error(`${path} responded ${res.status} ${res.statusText}`)
+    const errBody = (await res.json().catch(() => null)) as { error?: string } | null
+    throw new Error(errBody?.error ?? `${path} responded ${res.status} ${res.statusText}`)
   }
   return (await res.json()) as T
 }
 
 export const getHealth = (signal?: AbortSignal) => getJSON<Health>('/api/health', signal)
 
-export const listPersonas = (signal?: AbortSignal) => getJSON<Persona[]>('/api/personas', signal)
+export const listAgents = (signal?: AbortSignal) => getJSON<Agent[]>('/api/personas', signal)
 
-export const createConversation = (personaId: string, title = '', signal?: AbortSignal) =>
-  postJSON<Conversation>('/api/conversations', { personaId, title }, signal)
+export const createMeeting = (topic: string, personaSlugs: string[], signal?: AbortSignal) =>
+  postJSON<Meeting>('/api/meetings', { topic, personaSlugs }, signal)
 
-export const getConversation = (id: string, signal?: AbortSignal) =>
-  getJSON<Conversation>(`/api/conversations/${encodeURIComponent(id)}`, signal)
+export const getMeeting = (id: string, signal?: AbortSignal) =>
+  getJSON<Meeting>(`/api/meetings/${encodeURIComponent(id)}`, signal)
 
 /**
- * sendMessage streams the reply as an async generator of ChatEvent.
+ * sendTurn streams a meeting turn as an async generator of MeetingEvent.
  *
  * Uses fetch + ReadableStream rather than EventSource: EventSource can only
- * issue GET requests, and this endpoint needs a POST body.
+ * issue GET requests, and this endpoint needs a POST body. The frame parser
+ * itself is unchanged from the pre-A2A single-persona client — only the
+ * event payload shapes differ (see MeetingEvent above).
  */
-export async function* sendMessage(
-  conversationId: string,
+export async function* sendTurn(
+  meetingId: string,
   content: string,
+  rounds: number,
   signal?: AbortSignal,
-): AsyncGenerator<ChatEvent> {
-  const res = await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/messages`, {
+): AsyncGenerator<MeetingEvent> {
+  const res = await fetch(`/api/meetings/${encodeURIComponent(meetingId)}/turns`, {
     method: 'POST',
     signal,
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, rounds }),
   })
   if (!res.ok || !res.body) {
-    throw new Error(`send message responded ${res.status} ${res.statusText}`)
+    throw new Error(`send turn responded ${res.status} ${res.statusText}`)
   }
 
   const reader = res.body.getReader()
@@ -107,7 +129,7 @@ export async function* sendMessage(
   }
 }
 
-function parseSSEFrame(frame: string): ChatEvent | null {
+function parseSSEFrame(frame: string): MeetingEvent | null {
   let data: string | null = null
   for (const line of frame.split('\n')) {
     if (line.startsWith('data: ')) {
@@ -117,5 +139,5 @@ function parseSSEFrame(frame: string): ChatEvent | null {
     // information the client needs beyond what's already encoded in data.
   }
   if (data === null) return null
-  return JSON.parse(data) as ChatEvent
+  return JSON.parse(data) as MeetingEvent
 }

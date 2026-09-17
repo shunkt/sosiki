@@ -1,0 +1,25 @@
+# Creates the knowledge bucket, then exits — mirrors docker-compose.yml's
+# minio-init service. ttlSecondsAfterFinished cleans it up automatically so
+# re-running `kubectl apply -k` doesn't hit "Job is immutable" — see the
+# plan's GOTCHA on Job specs being immutable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: kaigi
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 5
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: quay.io/minio/mc
+          command:
+            - /bin/sh
+            - -c
+            - |
+              mc alias set local http://minio:9000 minioadmin minioadmin &&
+              mc mb --ignore-existing local/kaigi-knowledge &&
+              echo "bucket kaigi-knowledge ready"

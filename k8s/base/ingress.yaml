@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kaigi
+  namespace: kaigi
+  annotations:
+    # Buffering off is mandatory for SSE — without it nginx accumulates the
+    # whole response before forwarding, and tokens arrive in one lump at the
+    # end instead of streaming. Same reasoning as Caddy's own X-Accel-Buffering
+    # header and the plan's GOTCHA on this exact setting.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: kaigi.localtest.me
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

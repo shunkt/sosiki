@@ -1,83 +1,113 @@
 # kaigi
 
-ペルソナ（知識 + 性格）と会話する API。Vite + React (TypeScript) フロントエンドと Go バックエンド。
+ペルソナ（知識 + 性格）が A2A（Agent2Agent）プロトコルで会話する会議アプリ。複数のペルソナが同じ議題について発言し、互いの発言に反応する。Vite + React (TypeScript) フロントエンドと Go バックエンド。
 
-知識は pgvector によるベクトル検索と MinIO 上の原本ファイルの二段構えで取得し、性格はクエリ書き換え・リランキング・システムプロンプトの3段階で回答に作用する。応答は SSE でストリーミングし、会話は Postgres に永続化する。
+知識は pgvector によるベクトル検索と MinIO 上の原本ファイルの二段構えで取得し、性格はクエリ書き換え・リランキング・システムプロンプトの3段階で回答に作用する。応答は SSE でストリーミングし、会議は Postgres に永続化する。
 
 ## アーキテクチャ
 
+ペルソナは1体1プロセスの独立した **A2A エージェント**。司会（moderator）が会議録を共有しながら参加者を逐次呼び出すことで、同じ知識ベースを見ながら互いの主張に反応する会議になる。
+
 ```
-                       ┌─────────────────────────────────────────┐
-  POST /api/           │           chat.Engine                    │
-  conversations/{id}/  │                                          │
-  messages  ────────▶  │ 1. 履歴ロード       ────▶ Postgres       │
-       (SSE)           │ 2. クエリ書き換え   ──▶ OpenAI(JSON出力)  │
-       ◀────token───   │ 3. ベクトル検索     ────▶ pgvector        │
-       ◀────token───   │ 4. 性格重み付け     ──── (コサイン類似度   │
-       ◀────sources──  │    + 性格の関心スコア      + affinity)    │
-       ◀────done─────  │ 5. コンテキスト拡張 ────▶ MinIO(Range GET) │
-                       │ 6. 生成            ──▶ OpenAI(streaming) │
-                       │ 7. 保存            ────▶ Postgres        │
-                       └─────────────────────────────────────────┘
+Browser ──REST/SSE──▶ frontend pod (web:Caddy + moderator:Go)
+                          │
+                          ├─ GET /registry/agents ──▶ discovery pod
+                          │                            （エージェントカード・
+                          │                             カタログ。自己登録+TTL）
+                          │
+                          ├─ A2A SendStreamingMessage ─▶ persona-critic pod
+                          ├─ A2A SendStreamingMessage ─▶ persona-pragmatist pod
+                          │     （参加者ごとに逐次。会議録を共有するので
+                          │      後続の参加者は先行発言に反応できる）
+                          │
+postgres（1インスタンス）  │                            minio
+ ├─ kaigi_meeting   ◀─────┘（司会が読み書き）            （原本ファイル。
+ ├─ kaigi_registry  ◀── discovery                        persona pod が
+ ├─ kaigi_persona   ◀── persona pod 全体で共有            Range GET で
+ └─ kaigi_knowledge ◀── persona pod 全体で読む             コンテキスト拡張）
 ```
 
-### 性格が情報処理に作用する3点
+### ペルソナが情報処理に作用する3点
 
 | 段階 | 性格のどの要素が効くか | 実装 |
 |---|---|---|
 | **① クエリ書き換え** | `Stance` + `Interests` | ペルソナが実際にどう検索するかを OpenAI に JSON 出力で考えさせ、最大3本のクエリに展開する |
 | **② 性格重み付け** | `Interests`（重み付き） + `Skepticism` | `Final = (1-λ)·Relevance + λ·Affinity`。`Relevance` は pgvector のコサイン類似度、`Affinity` は関心トピック埋め込みとチャンクの cosine 加重和。`Skepticism` が高いほど、関連度の足切り閾値が上がる（採用する資料そのものが変わる） |
-| **③ 生成** | `Stance` + `Verbosity` + `Skepticism` | システムプロンプトを組み立てる。ペルソナごとに内容が固定なので、OpenAI の自動コンテキストキャッシュが効く |
+| **③ 生成** | `Stance` + `Verbosity` + `Skepticism` | システムプロンプトを組み立てる。会議の参加者名（自分以外）も含めるが、参加者集合が同じ限りバイト同一を保つので OpenAI の自動コンテキストキャッシュが効く |
 
 `PERSONA_INFLUENCE`（λ）は環境変数。`0` で純粋な RAG に退化するので、性格の効きを A/B できる。
+
+### ペルソナ同士の「相互のやりとり」の仕組み
+
+ペルソナ pod 同士は直接通信しない（スター型）。代わりに、司会が各ラウンドで参加者を1人ずつ順番に呼び、そのたびに**その時点までの会議録全体**（同じラウンド内の先行発言も含む）を渡す。これにより:
+
+```
+Round 1: critic ──▶ 発言A（会議録: [議題]）
+         pragmatist ──▶ 発言B（会議録: [議題, 発言A]）  ← 発言Aに反応できる
+Round 2: critic ──▶ 発言C（会議録: [議題, 発言A, 発言B]） ← 発言Bに反論できる
+```
+
+参加者ループは**逐次でなければならない**。並列化すると同じラウンドの他者の発言が見えなくなり、議論ではなく独立したN本の回答になる（`internal/meeting/moderator_test.go` の `TestModeratorSequential` が回帰を防いでいる）。
 
 ## レイアウト
 
 ```
-docker-compose.yml     postgres+pgvector / MinIO / backend / frontend / seed
-frontend/               Vite + React + TypeScript
-  Dockerfile            node でビルド → Caddy で配信するマルチステージ
-  Caddyfile             SPA フォールバック + /api を backend へリバースプロキシ
-  src/api/client.ts     ペルソナ/会話 API の型付きクライアント、SSE ストリーム
-  src/App.tsx           チャット UI
+docker-compose.yml      postgres+pgvector(4DB) / minio / discovery / persona×2 / moderator / frontend / seed
+k8s/                     Kubernetes マニフェスト（kind 前提）
+  base/                  Kustomize base（namespace/config/secret/postgres/minio/discovery/personas/frontend/ingress）
+  overlays/local/        kind 向け overlay（imagePullPolicy:Never、MinIO NodePort、ローカル秘密情報）
+  kind-cluster.yaml       kind クラスタ定義
+frontend/                Vite + React + TypeScript
+  Dockerfile             node でビルド → Caddy で配信するマルチステージ
+  Caddyfile              SPA フォールバック + /api を {$BACKEND_ADDR} へリバースプロキシ
+  src/api/client.ts      エージェント一覧/会議 API の型付きクライアント、SSE ストリーム
+  src/App.tsx            会議 UI（参加者選択・ラウンド区切り・話者ごとの引用）
 backend/
-  Dockerfile            server と seed の2バイナリを distroless に載せる
-  cmd/server/           main: 依存の組み立て、HTTP サーバ、graceful shutdown
-  cmd/seed/              dev 用フィクスチャ投入（MinIO + pgvector + サンプルペルソナ2体）
-  internal/api/          ルーティング、ハンドラ、SSE、CORS
-  internal/config/       環境変数ベースの設定
-  internal/db/           pgxpool + 埋め込みマイグレータ
-  internal/persona/      ペルソナのドメイン型と永続化
-  internal/retrieval/    OpenAI 埋め込みクライアント、pgvector 検索、性格重み付きランキング
-  internal/objectstore/  MinIO クライアント（Range GET によるコンテキスト拡張）
-  internal/chat/         RAG オーケストレーション、システムプロンプト組み立て、OpenAI ストリーミング
+  Dockerfile             moderator/discovery/persona/seed の4バイナリを distroless に載せる
+  cmd/moderator/         REST+SSE（ブラウザ向け）、A2A クライアント（司会）
+  cmd/discovery/         エージェントカード・カタログの HTTP API
+  cmd/persona/           A2A サーバ。1プロセス=1ペルソナ（PERSONA_SLUG で指定）
+  cmd/seed/               dev 用フィクスチャ投入（MinIO + kaigi_persona/kaigi_knowledge にサンプル2体+文書3件）
+  internal/api/           moderator のルーティング、ハンドラ、SSE、CORS
+  internal/agentapi/      discovery のルーティング、ハンドラ
+  internal/config/        環境変数ベースの設定、DB DSN 組み立て
+  internal/db/            pgxpool + 埋め込みマイグレータ（4セット: meeting/registry/persona/knowledge）
+  internal/meeting/       会議ドメイン、永続化、司会のラウンド進行ロジック、A2Aダイアラ
+  internal/registry/      エージェント登録のドメイン・永続化・（ペルソナ側の）自己登録クライアント
+  internal/persona/       ペルソナのドメイン型と永続化
+  internal/retrieval/     OpenAI 埋め込みクライアント、pgvector 検索、性格重み付きランキング
+  internal/objectstore/   MinIO クライアント（Range GET によるコンテキスト拡張）
+  internal/chat/          RAG パイプライン、システムプロンプト組み立て、OpenAI ストリーミング
+  internal/a2aconv/       A2A ワイヤ型 ⇔ ドメイン型の変換、ペルソナのエージェントカード生成
+  internal/personaexec/   chat.Engine を A2A の AgentExecutor に橋渡し
 ```
 
 ## 要件
 
 - Node 20+（開発は 26）と npm
 - Go 1.22+（開発は 1.26）— ルーティングは `net/http` のメソッド付きパターンでルータ依存なし
-- Docker（postgres+pgvector / MinIO を動かす）
+- Docker（postgres+pgvector / MinIO / 各サービスコンテナを動かす）
 - OpenAI の API キー（<https://platform.openai.com/api-keys>）
+- k8s で動かす場合: [kind](https://kind.sigs.k8s.io/) と `kubectl`
 
 ## はじめかた
 
-起動方法は2通りある。どちらも <http://localhost:5173> を開いて使う。**ホスト port 8080 を取り合うので併用はできない。**
+起動方法は3通り。いずれも同じ環境変数（`.env`）を使う。**ホスト port 8080 を取り合うので `make dev` と `make docker-up` は併用できない。**
 
-### A. 全部 Docker（Go / Node をホストに入れなくてよい）
+### A. 全部 Docker Compose（Go / Node をホストに入れなくてよい）
 
 ```sh
 cp .env.example .env
 # .env を開き OPENAI_API_KEY を設定する
 
-make docker-up    # postgres/MinIO/backend/frontend をビルドして起動
+make docker-up    # postgres/minio/discovery/persona×2/moderator/frontend をビルドして起動
 make docker-seed  # サンプル文書3件とペルソナ2体（批評家/実務家）を投入（初回のみ）
 ```
 
-frontend は Caddy が静的ファイルを配信し、`/api/*` を backend コンテナへリバースプロキシする。ブラウザからは同一オリジンにしか見えないので CORS は経由しない。
+<http://localhost:5173> を開く。frontend の Caddy が静的ファイルを配信し、`/api/*` を moderator コンテナへリバースプロキシする。ブラウザからは同一オリジンにしか見えないので CORS は経由しない。
 
 ```sh
-make docker-logs  # backend/frontend のログを追う
+make docker-logs  # discovery/persona/moderator/frontend のログを追う
 make docker-down  # 停止
 ```
 
@@ -90,115 +120,110 @@ cp .env.example .env
 make setup   # npm install + go mod download
 make up      # postgres/MinIO だけを起動し、healthy になるまで待つ
 make seed    # サンプル文書3件とペルソナ2体を投入
-make dev     # Go API を :8080、Vite を :5173 で起動（up は自動実行される）
+make dev     # discovery(:8081)/persona-critic(:8082)/persona-pragmatist(:8083)/
+             # moderator(:8080)/Vite(:5173) を一括起動（up は自動実行される）
 ```
 
-`make up` が postgres/MinIO しか起動しないのは意図的で、backend コンテナまで立ち上げると `make dev` のホスト側 Go プロセスと port 8080 が衝突するため。
+`make up` が postgres/MinIO しか起動しないのは意図的で、backend コンテナまで立ち上げると `make dev` のホスト側プロセスとポートが衝突するため。
 
-バックエンド/フロントエンドは `make dev-backend` / `make dev-frontend` で個別にも起動できる。
+各プロセスは `make dev-discovery` / `make dev-persona-critic` / `make dev-persona-pragmatist` / `make dev-moderator` / `make dev-frontend` で個別にも起動できる。
 
 > **Note**: B の経路では `.env` は自動で読み込まれない（Go 側に dotenv ローダを入れていない）。direnv を使うか `set -a; source .env; set +a` などで export すること。A の経路では compose の `env_file` が読み込む。
 
-## API
+### C. Kubernetes（kind）
+
+```sh
+cp .env.example .env
+# .env を開き OPENAI_API_KEY を設定する
+cp k8s/overlays/local/secret-patch.yaml.example k8s/overlays/local/secret-patch.yaml
+# secret-patch.yaml を開き OPENAI_API_KEY を設定する（gitignore 済み。実キーをコミットしないこと）
+
+make kind-up     # kind クラスタを作成し、ingress-nginx を導入
+make kind-load   # backend/frontend イメージをビルドして kind ノードへロード
+make k8s-up      # overlays/local を apply。postgres/minio が ready になるまで待つ
+make k8s-seed    # サンプル文書3件とペルソナ2体を投入（初回のみ。Job は再実行時に自動で作り直す）
+```
+
+<http://kaigi.localtest.me> を開く（`localtest.me` は 127.0.0.1 を指すワイルドカード DNS なので `/etc/hosts` の追加は不要）。
+
+```sh
+make k8s-logs   # discovery/persona/frontend のログを追う
+make k8s-down   # kaigi namespace を削除（クラスタ自体は残す）
+make kind-down  # kind クラスタごと削除
+```
+
+**ペルソナを追加する場合**: `k8s/base/personas/persona-critic.yaml` をコピーし、`name`/`selector`/`PERSONA_SLUG`/`A2A_PUBLIC_URL`/Service 名の4箇所を変更、`k8s/base/kustomization.yaml` の `resources` に追加、`backend/cmd/seed/main.go` の `seedPersonas` に対応する `CreateInput`（同じ `Slug`）を追加する。docker-compose 側も同様（`persona-critic` サービスをコピー）。
+
+## API（moderator）
 
 | Method | Path                                | 説明 |
 | ------ | ----------------------------------- | --- |
 | GET    | `/api/health`                       | `{"status":"ok\|degraded","db":"ok"}` |
-| GET    | `/api/personas`                     | ペルソナ一覧 |
-| POST   | `/api/personas`                     | ペルソナ作成（関心トピックは作成時に埋め込まれる） |
-| GET    | `/api/personas/{id}`                | ペルソナ取得 |
-| PATCH  | `/api/personas/{id}`                | `stance` / `verbosity` / `skepticism` を更新 |
-| POST   | `/api/conversations`                | 会話作成（`personaId` 必須） |
-| GET    | `/api/conversations/{id}`           | 会話と履歴の取得 |
-| POST   | `/api/conversations/{id}/messages`  | メッセージ送信。応答は SSE（`sources` → `token`* → `done`） |
-| GET    | `/api/documents/{id}`               | 原本ファイルへの presigned URL にリダイレクト |
+| GET    | `/api/personas`                     | discovery 由来のエージェント一覧（`present` 付き） |
+| POST   | `/api/meetings`                     | 会議作成。`{"topic": string, "personaSlugs": string[]}`。不在のペルソナを含むと 400 |
+| GET    | `/api/meetings/{id}`                | 会議・参加者・全発言（引用含む）の取得 |
+| POST   | `/api/meetings/{id}/turns`          | 発言を送信。応答は SSE |
 
-`POST .../messages` のレスポンスは `text/event-stream`。フレームは `event: <type>\ndata: <json>\n\n`。`type` は `sources` / `token` / `done` / `error`。
+`POST .../turns` のレスポンスは `text/event-stream`。フレームは `event: <type>\ndata: <json>\n\n`。`type` は `speaker_start` → `sources` → `token`*（話者ごとに繰り返し）→ `speaker_end`（または `speaker_error`）→ `round_end`（ラウンドごと）→ `done`。1発言の失敗は会議全体を止めず `speaker_error` として扱う。
+
+discovery pod（`GET /registry/agents`、`POST /registry/agents`）とペルソナ pod（A2A JSON-RPC、`/.well-known/agent-card.json`）にも直接アクセスできる。ペルソナへの手動デバッグ例:
+
+```sh
+curl localhost:8082/.well-known/agent-card.json | jq .
+curl localhost:8082 -X POST -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"SendMessage",
+  "params":{"message":{"role":"ROLE_USER","parts":[{"text":"合意形成について"}]}}}' | jq .
+```
 
 ## その他のコマンド
 
 ```sh
 make test          # go test ./...（-race は手動で: cd backend && go test ./... -race）
 make lint          # oxlint + go vet
-make build         # frontend/dist + backend/bin/server
-make down          # docker compose を停止
-make logs          # docker compose のログを追う
-make clean         # ビルド成果物を削除
+make build          # frontend/dist + backend/bin 以下に4バイナリ
+make down            # docker compose を停止
+make logs             # docker compose のログを追う
+make clean             # ビルド成果物を削除
 
-make docker-build  # backend/frontend のイメージをビルド
+make docker-build  # 全サービスのイメージをビルド
 make docker-up     # 全部コンテナで起動
 make docker-seed   # seeder イメージでフィクスチャ投入
-make docker-logs   # backend/frontend のログを追う
+make docker-logs   # backend各サービス/frontend のログを追う
 make docker-down   # 全部停止
+
+make kind-up / kind-load / kind-down   # kind クラスタの作成・イメージロード・削除
+make k8s-up / k8s-seed / k8s-logs / k8s-down  # k8s デプロイ・投入・ログ・namespace削除
 ```
 
 ### 統合テスト
 
-`retrieval` / `db` / `objectstore` パッケージには実インフラに対する統合テストがある。`TEST_DATABASE_URL`（無ければ `DATABASE_URL`）などの環境変数が未設定なら自動的にスキップされる。
+`retrieval` / `db` / `objectstore` / `persona` / `meeting` / `registry` パッケージには実インフラに対する統合テストがある。対応する `TEST_*_DATABASE_URL` が未設定なら自動的にスキップされる。
 
 ```sh
-export DATABASE_URL="postgres://postgres:kaigi@localhost:5432/kaigi?sslmode=disable"
-cd backend && go test ./internal/retrieval/... -run TestSearchAgainstPostgres -v
+export TEST_KNOWLEDGE_DATABASE_URL="postgres://postgres:kaigi@localhost:5432/kaigi_knowledge?sslmode=disable"
+export TEST_MEETING_DATABASE_URL="postgres://postgres:kaigi@localhost:5432/kaigi_meeting?sslmode=disable"
+# ... persona / registry も同様
+cd backend && go test ./... -v
 ```
 
-`TestSearchAgainstPostgres` は本機能の受け入れ条件そのもの — 同一クエリに対して「批評家」（懐疑心が高い）と「実務家」（懐疑心が低い）で異なる資料が返ることを検証する。`make seed` 実行後でないと通らない。
+**`TestModeratorRounds`/`TestModeratorSequential`（`internal/meeting`）が本機能の受け入れ条件** — 2体目の参加者が受け取る会議録に1体目の直前の発言が含まれること、参加者ループが逐次であることを検証する。
+
+`retrieval.TestSearchAgainstPostgres` は性格重み付けの受け入れ条件 — 同一クエリに対して「批評家」（懐疑心が高い）と「実務家」（懐疑心が低い）で異なる資料が返ることを検証する。`make seed` 実行後でないと通らない。
 
 ## 設定
 
-`.env.example` を `.env` にコピーする。値は環境変数から読まれ、ファイル自体は参照用。
+`.env.example` を `.env` にコピーする。値は環境変数から読まれ、ファイル自体は参照用。全変数とその用途は `.env.example` 自身のコメントを参照。k8s の場合は `k8s/base/config.yaml`（ConfigMap）と `k8s/overlays/local/secret-patch.yaml`（Secret、要作成）に相当する。
 
-| 変数 | デフォルト | 用途 |
-| --- | --- | --- |
-| `ADDR` | `:8080` | backend |
-| `ALLOWED_ORIGINS` | `http://localhost:5173` | backend（CORS） |
-| `DATABASE_URL` | `postgres://postgres:kaigi@localhost:5432/kaigi?sslmode=disable` | backend, seed |
-| `MINIO_ENDPOINT` | `localhost:9000` | backend, seed（バックエンドが接続する先） |
-| `MINIO_PUBLIC_ENDPOINT` | `localhost:9000` | backend（presigned URL の生成先。ブラウザから引ける名前にする） |
-| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | `minioadmin` | backend, seed |
-| `MINIO_BUCKET` | `kaigi-knowledge` | backend, seed |
-| `MINIO_USE_SSL` | `false` | backend |
-| `MINIO_REGION` | `us-east-1` | backend, seed（presign 時のリージョン。未指定だとネットワーク越しの照会が走る） |
-| `OPENAI_API_KEY` | （必須、既定なし） | backend, seed（chat + embedding 共用）。未設定だと起動時に失敗する |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | backend, seed |
-| `CHAT_MODEL` | `gpt-5-mini` | backend |
-| `EMBED_MODEL` | `text-embedding-3-small` | backend, seed。`vector(1536)` と幅が一致する text-embedding-3 系であること |
-| `CANDIDATE_K` | `40` | backend（pgvector から取る候補数） |
-| `FINAL_N` | `8` | backend（性格重み付け後にプロンプトへ載せる件数） |
-| `PERSONA_INFLUENCE` | `0.25` | backend（性格の効き具合 λ、0..1） |
-| `CONTEXT_PAD_BYTES` | `1200` | backend（MinIO Range GET でチャンク前後に読み足すバイト数） |
-| `RELEVANCE_FLOOR` | `0.25` | backend（引用に必要な最低コサイン類似度） |
-| `RELEVANCE_SKEPTICISM_SPAN` | `0.20` | backend（`Skepticism` に応じて閾値が上乗せされる幅） |
-| `VITE_API_PROXY_TARGET` | `http://localhost:8080` | frontend |
-
-開発時は Vite のプロキシ、Docker 起動時は Caddy のリバースプロキシにより、いずれもブラウザからは単一オリジンにしか見えないため CORS は経由しない。`ALLOWED_ORIGINS` はフロントエンドを別ホストから配信する場合に効く。
-
-`make docker-up` で起動した場合、コンテナ内から見た接続先が変わるため以下は `docker-compose.yml` 側で上書きされる（`.env` の値より優先される）。
-
-| 変数 | コンテナでの値 | 理由 |
-| --- | --- | --- |
-| `DATABASE_URL` | `...@postgres:5432/...` | compose ネットワーク内のサービス名で解決する |
-| `MINIO_ENDPOINT` | `minio:9000` | backend → MinIO はサービス名で接続する |
-| `MINIO_PUBLIC_ENDPOINT` | `localhost:9000` | presigned URL を開くのはブラウザなので、公開ポートを指す必要がある |
-
-### 既存環境からの移行
-
-埋め込みモデルが変わったのでベクトルの次元も空間も変わる。マイグレーション `0002` が
-`chunks` と `persona_interests` を空にするので、再 seed が必要。
-
-```sh
-make down
-docker volume rm kaigi_hf-cache   # TEI のモデルキャッシュ(~2.5GB)を解放
-make up
-cd backend && go run ./cmd/server   # マイグレーション 0002 を適用
-make seed                            # 1536 次元で作り直す
-```
-
-既存の会話の本文は残るが、引用（`message_citations`）は `chunks` の削除に連動して消える。
+`make docker-up` で起動した場合、コンテナ内から見た接続先が変わるため `POSTGRES_BASE_URL`・`MINIO_ENDPOINT`・`REGISTRY_URL`・`A2A_PUBLIC_URL` は `docker-compose.yml` 側で上書きされる（`.env` の値より優先される）。k8s では `k8s/base/config.yaml` と各 Deployment の `env` がこれに相当する。
 
 ## スコープ外
 
 - 知識の取り込み API（アップロード → 抽出 → チャンク → 埋め込み投入の HTTP エンドポイント）。`make seed` の dev スクリプトのみ
 - 認証・認可・マルチテナント
-- ペルソナ・会話の削除
+- ペルソナ・会議の削除
 - PDF/docx からのテキスト抽出（seed は `.md` のみ扱う）
-- ハイブリッド検索、会話の自動要約・圧縮
+- ハイブリッド検索、会議の自動要約・圧縮
+- ペルソナ pod 同士の直接通信（A2A のメッシュ型トポロジ）。現在はスター型（司会経由）
+- A2A の push notification、署名付きエージェントカード
+- ペルソナ pod の HPA・オートスケール、Postgres/MinIO の HA
+- 本番向け TLS・cert-manager

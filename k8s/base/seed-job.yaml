@@ -1,0 +1,23 @@
+# Not applied automatically — run on demand with `make k8s-seed`, which
+# deletes any previous run first (Job specs are immutable, so a bare
+# `kubectl apply -k` after editing this file would be rejected otherwise).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed
+  namespace: kaigi
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: seed
+          image: kaigi-backend
+          command: ["/app/seed"]
+          envFrom:
+            - configMapRef:
+                name: kaigi-config
+            - secretRef:
+                name: kaigi-secrets

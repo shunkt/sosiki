@@ -1,0 +1,55 @@
+# kind never pulls kaigi-backend/kaigi-frontend from a registry — they only
+# exist as images loaded into the cluster's nodes via `kind load
+# docker-image` (see Makefile's k8s-load target). Without imagePullPolicy:
+# Never, the kubelet's default (IfNotPresent, which still checks a registry
+# for a mutable ":latest"-style tag) can try to pull "kaigi-backend" from
+# Docker Hub and fail with ImagePullBackOff — see the plan's GOTCHA.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: discovery
+  namespace: kaigi
+spec:
+  template:
+    spec:
+      containers:
+        - name: discovery
+          imagePullPolicy: Never
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: persona-critic
+  namespace: kaigi
+spec:
+  template:
+    spec:
+      containers:
+        - name: persona
+          imagePullPolicy: Never
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: persona-pragmatist
+  namespace: kaigi
+spec:
+  template:
+    spec:
+      containers:
+        - name: persona
+          imagePullPolicy: Never
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: kaigi
+spec:
+  template:
+    spec:
+      containers:
+        - name: web
+          imagePullPolicy: Never
+        - name: moderator
+          imagePullPolicy: Never

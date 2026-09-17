@@ -1,0 +1,20 @@
+# base's minio Service is headless (ClusterIP: None) for in-cluster use.
+# Presigned URLs are opened by the BROWSER though, which cannot reach a
+# cluster-internal address — NodePort 30900 is what kind-cluster.yaml maps
+# to the Mac's own localhost:9000 (see that file's extraPortMappings).
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: kaigi
+spec:
+  type: NodePort
+  clusterIP: null
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+      nodePort: 30900
+    - name: console
+      port: 9001
+      targetPort: 9001

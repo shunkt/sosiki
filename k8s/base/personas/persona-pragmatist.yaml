@@ -1,0 +1,62 @@
+# See persona-critic.yaml's header comment for how to add another persona.
+apiVersion: v1
+kind: Service
+metadata:
+  name: persona-pragmatist
+  namespace: kaigi
+spec:
+  selector:
+    app: persona-pragmatist
+  ports:
+    - port: 8083
+      targetPort: 8083
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: persona-pragmatist
+  namespace: kaigi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: persona-pragmatist
+  template:
+    metadata:
+      labels:
+        app: persona-pragmatist
+    spec:
+      containers:
+        - name: persona
+          image: kaigi-backend
+          command: ["/app/persona"]
+          envFrom:
+            - configMapRef:
+                name: kaigi-config
+            - secretRef:
+                name: kaigi-secrets
+          env:
+            - name: ADDR
+              value: ":8083"
+            - name: PERSONA_SLUG
+              value: "pragmatist"
+            - name: A2A_PUBLIC_URL
+              value: "http://persona-pragmatist.kaigi.svc.cluster.local:8083"
+          ports:
+            - containerPort: 8083
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8083
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8083
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi

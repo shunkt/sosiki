@@ -1,0 +1,14 @@
+# Strategic merge patch, not configMapGenerator+behavior:merge — the
+# generator approach hits a Kustomize namespace-resolution bug where the
+# merge-target lookup can't find base's already-namespaced ConfigMap. A
+# direct patch sidesteps it entirely.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kaigi-config
+  namespace: kaigi
+data:
+  # Browser-reachable: MinIO's NodePort, mapped to the Mac's own
+  # localhost:9000 by kind-cluster.yaml — see minio-nodeport-patch.yaml
+  # and the plan's GOTCHA on this exact value.
+  MINIO_PUBLIC_ENDPOINT: "localhost:9000"

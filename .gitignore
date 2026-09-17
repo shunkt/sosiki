@@ -23,3 +23,4 @@ coverage.out
 .DS_Store
 .idea/
 .vscode/
+k8s/overlays/local/secret-patch.yaml
