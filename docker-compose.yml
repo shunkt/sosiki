@@ -70,7 +70,7 @@ services:
       retries: 20
 
   minio:
-    image: minio/minio
+    image: quay.io/minio/minio
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -89,7 +89,7 @@ services:
   # One-shot: creates the knowledge bucket, then exits. `docker compose ps` will
   # show it as exited, which is the success state.
   minio-init:
-    image: minio/mc
+    image: quay.io/minio/mc
     depends_on:
       minio:
         condition: service_healthy

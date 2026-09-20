@@ -7,6 +7,7 @@ import {
   type Agent,
   type Turn,
 } from './api/client'
+import { Markdown } from './Markdown'
 import './App.css'
 
 type Status = 'checking' | 'ok' | 'degraded' | 'unreachable'
@@ -265,9 +266,11 @@ function App() {
               }`}
             >
               <span className="message-role">{item.turn.role === 'user' ? 'user' : item.turn.speakerName}</span>
-              <p className="message-content">
-                {item.turn.content || (item.turn.pending ? '…' : '')}
-              </p>
+              {item.turn.role === 'persona' && !item.turn.failed && item.turn.content ? (
+                <Markdown streaming={!!item.turn.pending}>{item.turn.content}</Markdown>
+              ) : (
+                <div className="message-content">{item.turn.content || (item.turn.pending ? '…' : '')}</div>
+              )}
               {item.turn.citations && item.turn.citations.length > 0 && (
                 <ol className="sources">
                   {item.turn.citations.map((c) => (
