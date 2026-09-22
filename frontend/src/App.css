@@ -20,6 +20,29 @@
   font-size: 1.5rem;
 }
 
+.app-nav {
+  display: flex;
+  gap: 0.75rem;
+  font-size: 0.9rem;
+}
+
+.app-nav a {
+  color: inherit;
+  opacity: 0.6;
+  text-decoration: none;
+}
+
+.app-nav a[aria-current='page'] {
+  opacity: 1;
+  font-weight: 600;
+  border-bottom: 2px solid #2e9e5b;
+}
+
+.app--page {
+  height: auto;
+  min-height: calc(100vh - 4rem);
+}
+
 .status {
   font-size: 0.85rem;
   opacity: 0.75;
@@ -330,4 +353,115 @@
 .markdown th {
   font-weight: 600;
   background: var(--code-bg);
+}
+
+.persona-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.persona-card {
+  padding: 0.75rem 1rem;
+  border: 1px solid rgba(128, 128, 128, 0.3);
+  border-radius: 8px;
+}
+
+.persona-card--absent {
+  opacity: 0.5;
+}
+
+.persona-card__header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.persona-card__name {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.persona-card__slug {
+  font-size: 0.8rem;
+  opacity: 0.6;
+}
+
+.persona-card__presence {
+  margin-left: auto;
+  font-size: 0.85rem;
+  opacity: 0.75;
+}
+
+.persona-card__presence--on {
+  color: #2e9e5b;
+  opacity: 1;
+}
+
+.persona-card__stance {
+  margin: 0.5rem 0 0;
+  font-size: 0.9rem;
+}
+
+.persona-card__missing {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+  opacity: 0.6;
+  font-style: italic;
+}
+
+.persona-card__facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.2rem 0.6rem;
+  margin: 0.6rem 0 0;
+  font-size: 0.85rem;
+}
+
+.persona-card__facts dt {
+  opacity: 0.6;
+}
+
+.persona-card__facts dd {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.meter {
+  width: 6rem;
+  height: 0.6rem;
+}
+
+.interest-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.6rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.interest {
+  padding: 0.2rem 0.55rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.8rem;
+}
+
+.interest--positive {
+  color: #2e9e5b;
+}
+
+.interest--negative {
+  color: #d24545;
+}
+
+.interest-weight {
+  opacity: 0.8;
 }

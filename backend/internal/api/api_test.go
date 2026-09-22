@@ -127,6 +127,58 @@ func TestListPersonas(t *testing.T) {
 	}
 }
 
+// TestListPersonasPassesThroughProfile guards that handleListPersonas is a
+// pure pass-through of the discovery pod's AgentDTO (see internal/api/personas.go)
+// — the persona directory's profile field must reach the browser unmodified,
+// and a nil profile must serialize as JSON null rather than being dropped.
+func TestListPersonasPassesThroughProfile(t *testing.T) {
+	h := NewHandler(testConfig(), Deps{
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Agents: fakeAgentLister{agents: []registry.AgentDTO{
+			{
+				Slug: "critic", Name: "批評家", Present: true,
+				Profile: &registry.Profile{
+					Stance:     "根拠のない主張には懐疑的",
+					Skepticism: 0.85,
+					Verbosity:  "concise",
+					Interests:  []registry.ProfileInterest{{Topic: "Raft", Weight: 0.6}},
+				},
+			},
+			{Slug: "pragmatist", Name: "実務家", Present: false, Profile: nil},
+		}},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/personas", nil))
+
+	var body []map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	if len(body) != 2 {
+		t.Fatalf("agents = %d entries, want 2", len(body))
+	}
+	if string(body[0]["profile"]) == "" {
+		t.Fatal("critic's \"profile\" key is missing from the JSON response")
+	}
+	if string(body[0]["profile"]) == "null" {
+		t.Error("critic's profile serialized as null, want the profile object")
+	}
+	if string(body[1]["profile"]) != "null" {
+		t.Errorf("pragmatist's profile = %s, want null", body[1]["profile"])
+	}
+
+	var agents []registry.AgentDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &agents); err != nil {
+		t.Fatalf("decode typed: %v", err)
+	}
+	if agents[0].Profile == nil || agents[0].Profile.Skepticism != 0.85 {
+		t.Errorf("agents[0].Profile = %+v, want Skepticism 0.85", agents[0].Profile)
+	}
+	if agents[1].Profile != nil {
+		t.Errorf("agents[1].Profile = %+v, want nil", agents[1].Profile)
+	}
+}
+
 func TestCreateMeetingRejectsAbsentPersona(t *testing.T) {
 	h := NewHandler(testConfig(), Deps{
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),

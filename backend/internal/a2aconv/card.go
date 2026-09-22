@@ -1,11 +1,13 @@
 package a2aconv
 
 import (
+	"log/slog"
 	"sort"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 
 	"github.com/shun/kaigi/backend/internal/persona"
+	"github.com/shun/kaigi/backend/internal/registry"
 )
 
 // cardVersion is the AgentCard's own version field — the persona-as-an-agent
@@ -28,6 +30,16 @@ func PersonaCard(p persona.Persona, publicURL string) *a2a.AgentCard {
 	// persona — interests come back from Postgres in no guaranteed order.
 	sort.Strings(tags)
 
+	extensions := []a2a.AgentExtension{}
+	if ext, err := personaProfileExtension(p); err != nil {
+		// The profile extension is optional, display-only data for the
+		// persona directory — a marshal failure here must not stop the
+		// persona pod from publishing a card at all, only omit the detail.
+		slog.Default().Warn("build persona profile extension failed", "persona", p.Name, "error", err)
+	} else {
+		extensions = append(extensions, ext)
+	}
+
 	return &a2a.AgentCard{
 		Name:        p.Name,
 		Description: p.Personality.Stance,
@@ -41,6 +53,7 @@ func PersonaCard(p persona.Persona, publicURL string) *a2a.AgentCard {
 			Streaming:         true,
 			PushNotifications: false,
 			ExtendedAgentCard: false,
+			Extensions:        extensions,
 		},
 		Skills: []a2a.AgentSkill{{
 			ID:          "opinion",
@@ -53,4 +66,22 @@ func PersonaCard(p persona.Persona, publicURL string) *a2a.AgentCard {
 		DefaultInputModes:  []string{"text/plain"},
 		DefaultOutputModes: []string{"text/plain"},
 	}
+}
+
+// personaProfileExtension converts a persona's full Personality — including
+// negative-weight interests, which the Skills[0].Tags list above excludes —
+// into the card extension the persona directory reads back via
+// registry.ProfileFromCard. Embedding is intentionally left out: it is
+// internal retrieval-tuning data, not something the UI displays.
+func personaProfileExtension(p persona.Persona) (a2a.AgentExtension, error) {
+	interests := make([]registry.ProfileInterest, len(p.Personality.Interests))
+	for i, in := range p.Personality.Interests {
+		interests[i] = registry.ProfileInterest{Topic: in.Topic, Weight: in.Weight}
+	}
+	return registry.ProfileExtension(registry.Profile{
+		Stance:     p.Personality.Stance,
+		Skepticism: p.Personality.Skepticism,
+		Verbosity:  string(p.Personality.Verbosity),
+		Interests:  interests,
+	})
 }

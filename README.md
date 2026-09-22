@@ -61,7 +61,10 @@ frontend/                Vite + React + TypeScript
   Dockerfile             node でビルド → Caddy で配信するマルチステージ
   Caddyfile              SPA フォールバック + /api を {$BACKEND_ADDR} へリバースプロキシ
   src/api/client.ts      エージェント一覧/会議 API の型付きクライアント、SSE ストリーム
-  src/App.tsx            会議 UI（参加者選択・ラウンド区切り・話者ごとの引用）
+  src/App.tsx            ルーティングのみ（/ → MeetingPage、/personas → PersonasPage）
+  src/MeetingPage.tsx    会議 UI（参加者選択・ラウンド区切り・話者ごとの引用）
+  src/PersonasPage.tsx   ペルソナ一覧画面（在席状況・人格詳細を30秒間隔で再取得）
+  src/PersonaCard.tsx    ペルソナ1体分のカード（スタンス・懐疑度・冗長度・関心トピック）
 backend/
   Dockerfile             moderator/discovery/persona/seed の4バイナリを distroless に載せる
   cmd/moderator/         REST+SSE（ブラウザ向け）、A2A クライアント（司会）
@@ -159,10 +162,12 @@ make kind-down  # kind クラスタごと削除
 | Method | Path                                | 説明 |
 | ------ | ----------------------------------- | --- |
 | GET    | `/api/health`                       | `{"status":"ok\|degraded","db":"ok"}` |
-| GET    | `/api/personas`                     | discovery 由来のエージェント一覧（`present` 付き） |
+| GET    | `/api/personas`                     | discovery 由来のエージェント一覧（`present` 付き、`profile` に人格詳細） |
 | POST   | `/api/meetings`                     | 会議作成。`{"topic": string, "personaSlugs": string[]}`。不在のペルソナを含むと 400 |
 | GET    | `/api/meetings/{id}`                | 会議・参加者・全発言（引用含む）の取得 |
 | POST   | `/api/meetings/{id}/turns`          | 発言を送信。応答は SSE |
+
+フロントエンドは `/`（会議画面）と `/personas`（登録ペルソナ一覧。在席状況・スタンス・懐疑度・冗長度・関心トピックの重みを表示。`profile` が `null` のペルソナ pod は「詳細未登録」と表示する）の2画面。
 
 `POST .../turns` のレスポンスは `text/event-stream`。フレームは `event: <type>\ndata: <json>\n\n`。`type` は `speaker_start` → `sources` → `token`*（話者ごとに繰り返し）→ `speaker_end`（または `speaker_error`）→ `round_end`（ラウンドごと）→ `done`。1発言の失敗は会議全体を止めず `speaker_error` として扱う。
 

@@ -112,4 +112,8 @@ type AgentDTO struct {
 	Present   bool           `json:"present"`
 	Skills    []Skill        `json:"skills"`
 	Card      *a2a.AgentCard `json:"card"`
+	// Profile is the persona directory's personality detail — nil (JSON
+	// null) when Card has no persona-profile extension, e.g. a pod that
+	// registered before the extension existed. See ProfileFromCard.
+	Profile *Profile `json:"profile"`
 }

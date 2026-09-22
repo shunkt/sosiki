@@ -21,6 +21,7 @@ func toAgentDTO(a registry.Agent, present bool) registry.AgentDTO {
 		for i, s := range a.Card.Skills {
 			dto.Skills[i] = registry.Skill{ID: s.ID, Name: s.Name, Tags: s.Tags}
 		}
+		dto.Profile = registry.ProfileFromCard(a.Card)
 	}
 	return dto
 }

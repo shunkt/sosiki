@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/shun/kaigi/backend/internal/persona"
+	"github.com/shun/kaigi/backend/internal/registry"
 )
 
 func testCardPersona() persona.Persona {
@@ -68,6 +69,38 @@ func TestPersonaCardStreamingCapability(t *testing.T) {
 	}
 	if card.Capabilities.PushNotifications {
 		t.Error("Capabilities.PushNotifications = true, want false (out of scope — see plan's NOT Building)")
+	}
+}
+
+// TestPersonaCardCarriesProfileExtension guards the new profile channel:
+// registry.ProfileFromCard must recover the full personality — including
+// the negative-weight interest that Skills[0].Tags deliberately excludes.
+func TestPersonaCardCarriesProfileExtension(t *testing.T) {
+	p := testCardPersona()
+	card := PersonaCard(p, "http://persona-critic:8082")
+
+	profile := registry.ProfileFromCard(card)
+	if profile == nil {
+		t.Fatal("registry.ProfileFromCard(card) = nil, want a profile")
+	}
+	if profile.Stance != p.Personality.Stance {
+		t.Errorf("Stance = %q, want %q", profile.Stance, p.Personality.Stance)
+	}
+	if profile.Skepticism != p.Personality.Skepticism {
+		t.Errorf("Skepticism = %v, want %v", profile.Skepticism, p.Personality.Skepticism)
+	}
+	if len(profile.Interests) != 3 {
+		t.Fatalf("Interests = %v, want all 3 interests (including negative-weight)", profile.Interests)
+	}
+	// Weight descending, Topic ascending on ties: 形式的検証(0.8), Raft(0.6), マーケティング(-0.5).
+	wantOrder := []string{"形式的検証", "Raft", "マーケティング"}
+	for i, topic := range wantOrder {
+		if profile.Interests[i].Topic != topic {
+			t.Errorf("Interests[%d].Topic = %q, want %q (order = %v)", i, profile.Interests[i].Topic, topic, profile.Interests)
+		}
+	}
+	if profile.Interests[2].Weight != -0.5 {
+		t.Errorf("Interests[2].Weight = %v, want -0.5 (negative-weight interest missing from profile)", profile.Interests[2].Weight)
 	}
 }
 

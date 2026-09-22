@@ -1,12 +1,25 @@
 export type Health = { status: string; db?: string }
 
 export type Skill = { id: string; name: string; tags: string[] }
+export type ProfileInterest = { topic: string; weight: number }
+
+// Profile mirrors registry.Profile (backend/internal/registry/profile.go).
+// It is null for persona pods that registered before the profile extension
+// existed — they pick it up on their next heartbeat.
+export type Profile = {
+  stance: string
+  skepticism: number
+  verbosity: 'concise' | 'balanced' | 'detailed'
+  interests: ProfileInterest[]
+}
+
 export type Agent = {
   slug: string
   name: string
   personaId: string
   present: boolean
   skills: Skill[]
+  profile: Profile | null
 }
 
 export type Citation = {

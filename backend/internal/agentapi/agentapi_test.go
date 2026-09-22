@@ -122,3 +122,43 @@ func TestToAgentDTOFlattensSkillTags(t *testing.T) {
 		t.Error("Present = false, want true")
 	}
 }
+
+// TestToAgentDTOCarriesProfileWhenCardHasExtension covers the discovery
+// pod's own GET /registry/agents{,/{slug}} response, which toAgentDTO builds
+// directly — the plan's Task 7.
+func TestToAgentDTOCarriesProfileWhenCardHasExtension(t *testing.T) {
+	ext, err := registry.ProfileExtension(registry.Profile{
+		Stance:     "根拠のない主張には懐疑的",
+		Skepticism: 0.85,
+		Verbosity:  "concise",
+		Interests:  []registry.ProfileInterest{{Topic: "Raft", Weight: 0.6}},
+	})
+	if err != nil {
+		t.Fatalf("registry.ProfileExtension: %v", err)
+	}
+	card := &a2a.AgentCard{
+		Name:         "批評家",
+		Capabilities: a2a.AgentCapabilities{Extensions: []a2a.AgentExtension{ext}},
+	}
+
+	dto := toAgentDTO(registry.Agent{Slug: "critic", Card: card}, true)
+
+	if dto.Profile == nil {
+		t.Fatal("Profile = nil, want a profile (card has the extension)")
+	}
+	if dto.Profile.Skepticism != 0.85 {
+		t.Errorf("Profile.Skepticism = %v, want 0.85", dto.Profile.Skepticism)
+	}
+}
+
+// TestToAgentDTOProfileNilWithoutExtension covers a pod that registered
+// before the persona-profile extension existed — the directory must show it
+// with a null profile, not fail.
+func TestToAgentDTOProfileNilWithoutExtension(t *testing.T) {
+	card := &a2a.AgentCard{Name: "批評家"}
+	dto := toAgentDTO(registry.Agent{Slug: "critic", Card: card}, true)
+
+	if dto.Profile != nil {
+		t.Errorf("Profile = %+v, want nil (card has no persona-profile extension)", dto.Profile)
+	}
+}
